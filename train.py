@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Entry point for Autodidact: Curriculum Selection via Differential Soft Q-Learning.
+Entry point for Autodidact: Curriculum Selection via Discounted Soft Q-Learning.
 
 Each run produces:
     - A timestamped JSONL log file in logs/ with every metric at every step.
@@ -12,13 +12,10 @@ Usage:
     python train.py
 
     # Run with custom hyperparameters
-    python train.py --num_steps 5000 --beta 0.5 --num_candidates 32
+    python train.py --num_steps 5000 --beta 0.5 --gamma 0.95
 
-    # Run with baselines for comparison (each gets its own dashboard + combined)
+    # Run with baselines for comparison
     python train.py --run_baselines --num_steps 1000
-
-    # Run with wandb logging
-    python train.py --use_wandb --wandb_project my_project
 
     # Use a specific device
     python train.py --device cuda:0
@@ -36,56 +33,51 @@ from autodidact.logging import DashboardPlotter
 
 def parse_args() -> AutodidactConfig:
     parser = argparse.ArgumentParser(
-        description="Autodidact: Curriculum Selection via Differential Soft Q-Learning",
+        description="Autodidact: Curriculum Selection via Discounted Soft Q-Learning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Model
-    parser.add_argument("--model_name", type=str, default="gpt2", help="HuggingFace model name")
+    parser.add_argument("--model_name", type=str, default="gpt2")
 
     # Data
-    parser.add_argument("--dataset_name", type=str, default="openwebtext", help="HuggingFace dataset name")
-    parser.add_argument("--seq_len", type=int, default=1024, help="Context window length in tokens")
+    parser.add_argument("--dataset_name", type=str, default="openwebtext")
+    parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--num_candidates", type=int, default=256, help="N: candidates per step")
-    parser.add_argument("--held_out_subset_size", type=int, default=512, help="M: held-out subset size per step")
-    parser.add_argument("--held_out_total_size", type=int, default=8192, help="|D|: total held-out set size")
+    parser.add_argument("--held_out_subset_size", type=int, default=512, help="M: held-out subset size")
+    parser.add_argument("--held_out_total_size", type=int, default=8192, help="|D|: total held-out set")
 
-    # Batching (GPU utilization)
-    parser.add_argument("--extract_batch_size", type=int, default=32, help="Mini-batch size for candidate hidden state extraction")
-    parser.add_argument("--eval_batch_size", type=int, default=64, help="Mini-batch size for held-out reward computation")
+    # Batching
+    parser.add_argument("--extract_batch_size", type=int, default=32)
+    parser.add_argument("--eval_batch_size", type=int, default=64)
 
     # Q-learning
     parser.add_argument("--beta", type=float, default=1.0, help="Boltzmann temperature")
-    parser.add_argument("--q_lr", type=float, default=1e-4, help="Q-network learning rate (eta)")
-    parser.add_argument("--q_grad_clip", type=float, default=0.1, help="Q-network gradient clipping threshold")
-    parser.add_argument("--tau", type=float, default=0.01, help="EMA rate for average reward (rho)")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--q_lr", type=float, default=1e-4, help="Q-network learning rate")
+    parser.add_argument("--q_grad_clip", type=float, default=1.0, help="Q-network gradient clip")
 
     # LM training
-    parser.add_argument("--lm_lr", type=float, default=5e-5, help="LM learning rate (alpha)")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="LM gradient clipping threshold (G)")
+    parser.add_argument("--lm_lr", type=float, default=5e-5, help="LM learning rate")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="LM gradient clip")
 
     # Training
-    parser.add_argument("--num_steps", type=int, default=10000, help="Number of training steps")
-    parser.add_argument("--log_interval", type=int, default=10, help="Steps between stdout prints")
-    parser.add_argument("--eval_interval", type=int, default=100, help="Steps between full evaluations")
-    parser.add_argument("--dashboard_interval", type=int, default=50, help="Steps between dashboard refreshes")
+    parser.add_argument("--num_steps", type=int, default=10000)
+    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--eval_interval", type=int, default=100)
+    parser.add_argument("--dashboard_interval", type=int, default=50)
 
     # Logging
-    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for JSONL log files and dashboards")
-    parser.add_argument("--use_wandb", action="store_true", help="Enable wandb logging")
-    parser.add_argument("--wandb_project", type=str, default="autodidact", help="Wandb project name")
+    parser.add_argument("--log_dir", type=str, default="logs")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="autodidact")
 
     # Device
-    parser.add_argument("--device", type=str, default=None, help="Device (e.g., cuda:0, cpu)")
+    parser.add_argument("--device", type=str, default=None)
 
     # Baselines
-    parser.add_argument("--run_baselines", action="store_true", help="Also run baseline methods")
-    parser.add_argument(
-        "--baseline_methods",
-        type=str,
-        default="random,loss_based,uncertainty",
-        help="Comma-separated baseline methods",
-    )
+    parser.add_argument("--run_baselines", action="store_true")
+    parser.add_argument("--baseline_methods", type=str, default="random,loss_based,uncertainty")
 
     args = parser.parse_args()
     return AutodidactConfig(**vars(args))
@@ -105,15 +97,13 @@ def get_baseline_selector(name: str):
 def main():
     config = parse_args()
 
-    # Print config
     print("=" * 80)
-    print("Autodidact: Curriculum Selection via Differential Soft Q-Learning")
+    print("Autodidact: Curriculum Selection via Discounted Soft Q-Learning")
     print("=" * 80)
     for key, val in vars(config).items():
         print(f"  {key}: {val}")
     print("=" * 80)
 
-    # Collect all log file paths for combined dashboard
     all_log_files = []
 
     # --- Run Q-learning curriculum ---
@@ -128,9 +118,9 @@ def main():
         extract_batch_size=config.extract_batch_size,
         eval_batch_size=config.eval_batch_size,
         beta=config.beta,
+        gamma=config.gamma,
         q_lr=config.q_lr,
         q_grad_clip=config.q_grad_clip,
-        tau=config.tau,
         lm_lr=config.lm_lr,
         grad_clip=config.grad_clip,
         log_interval=config.log_interval,
@@ -170,16 +160,13 @@ def main():
                 device=config.device,
             )
             baseline_log = baseline_trainer.train(
-                num_steps=config.num_steps,
-                all_log_files=all_log_files,
+                num_steps=config.num_steps, all_log_files=all_log_files,
             )
             all_log_files.append(baseline_log)
 
-        # --- Final combined dashboard overlaying all methods ---
         print("\nRendering combined dashboard...")
         combined_path = os.path.join(config.log_dir, "combined_dashboard.png")
-        combined_dashboard = DashboardPlotter(output_path=combined_path)
-        combined_dashboard.render(all_log_files)
+        DashboardPlotter(output_path=combined_path).render(all_log_files)
         print(f"  Combined dashboard: {combined_path}")
 
     print(f"\nAll runs complete.")

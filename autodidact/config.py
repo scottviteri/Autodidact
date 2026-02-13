@@ -10,19 +10,12 @@ Defaults are tuned for an H100 80GB GPU:
     - extract_batch_size=32, eval_batch_size=64: large batches to utilize H100.
     - AdamW for LM, Adam for Q-network.
 
-GPU memory budget (H100 80GB):
-    Persistent: model (475 MB) + AdamW (949 MB) + held-out (64 MB) = ~1.5 GB
-    extract_hidden_states uses model.transformer directly (no LM head, no
-    intermediate hidden states), so peak per mini-batch is ~[B, seq_len, d]
-    instead of [B, seq_len, vocab_size] + 13x[B, seq_len, d].
-    Total peak ~3-4 GB, leaving >95% headroom.
-
-Q-network stability:
-    - q_lr=1e-4 (not 1e-3): the Q-network is a tiny 2-layer MLP; higher LRs
-      cause Q-values to blow up via the soft-value bootstrap feedback loop.
-    - q_grad_clip=0.1: separate, tighter grad clip for the Q-network. The reward
-      signal is O(1) (per-token log-prob ~-3.3), so Q-values should stay O(1) too.
-      Tight clipping prevents the logsumexp bootstrap from amplifying noise.
+Q-learning formulation:
+    Uses standard discounted soft Bellman equation:
+        Q(s, a) = r + gamma * V(s')
+        V(s) = beta * logsumexp(Q(s, a') / beta)
+    The discount factor gamma < 1 provides Bellman contraction, keeping
+    Q-values bounded. gamma=0.99 gives an effective horizon of ~100 steps.
 """
 
 from dataclasses import dataclass
@@ -49,9 +42,9 @@ class AutodidactConfig:
 
     # --- Q-learning ---
     beta: float = 1.0               # Boltzmann temperature
+    gamma: float = 0.99             # Discount factor
     q_lr: float = 1e-4              # eta: Q-network learning rate
-    q_grad_clip: float = 0.1        # Separate grad clip for Q-network
-    tau: float = 0.01               # EMA rate for rho
+    q_grad_clip: float = 1.0        # Q-network gradient clipping
 
     # --- LM training ---
     lm_lr: float = 5e-5             # alpha: LM learning rate

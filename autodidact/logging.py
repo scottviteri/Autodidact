@@ -102,10 +102,10 @@ class DashboardPlotter:
     Renders a 4x4 (16-panel) live dashboard from one or more JSONL log files.
     
     Panels (row-major):
-      Row 1: Reward (r_k)          | Avg Reward (rho)        | LM Loss              | Eval Perplexity
+      Row 1: Reward (r_k)          | Cumulative Reward       | LM Loss              | Eval Perplexity
       Row 2: TD Loss               | Q-value Mean            | Q-value Std           | Soft Value (V_k)
-      Row 3: Policy Entropy        | Entropy Ratio           | Selected Action Hist  | Reward Delta (r_k - rho)
-      Row 4: Step Time (s)         | Cumulative Reward       | LM Grad Norm          | Q Grad Norm
+      Row 3: Policy Entropy        | Entropy Ratio           | Selected Action Hist  | Q-value Min/Max
+      Row 4: Step Time (s)         | Q Grad Norm             | LM Grad Norm          | (empty)
     
     Saves to a PNG that can be viewed in any image viewer / IDE preview.
     The file is atomically replaced so viewers see a consistent image.
@@ -116,7 +116,7 @@ class DashboardPlotter:
     PANELS = [
         # Row 1
         ("Reward (r_k)",           "reward",               "line"),
-        ("Avg Reward (rho)",       "rho",                  "line"),
+        ("Cumulative Reward",     "cumulative_reward",    "line"),
         ("LM Loss",               "lm_loss",              "line"),
         ("Eval Perplexity",       "eval_perplexity",      "eval_line"),
         # Row 2
@@ -128,12 +128,12 @@ class DashboardPlotter:
         ("Policy Entropy",        "policy_entropy",       "line"),
         ("Entropy / Max Entropy", "policy_entropy_ratio", "line"),
         ("Action Distribution",   "selected_action",      "hist"),
-        ("Reward - rho",          "reward_minus_rho",     "line"),
+        ("Q Min / Max",           "q_min",                "line"),
         # Row 4
         ("Step Time (s)",         "step_time",            "line"),
-        ("Cumulative Reward",     "cumulative_reward",    "line"),
-        ("LM Grad Norm",         "lm_grad_norm",         "line"),
         ("Q Grad Norm",          "q_grad_norm",          "line"),
+        ("LM Grad Norm",         "lm_grad_norm",         "line"),
+        ("Q Max",                "q_max",                "line"),
     ]
 
     def __init__(self, output_path: str = "dashboard.png"):

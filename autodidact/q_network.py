@@ -10,8 +10,6 @@ Architecture (from Section 2.3 of the spec):
     Dimensions: d -> 32 -> 1  (d = 768 for GPT-2)
 """
 
-import math
-
 import torch
 import torch.nn as nn
 
@@ -67,9 +65,7 @@ def extract_hidden_states(model, input_ids: torch.Tensor, batch_size: int = 32) 
         for i in range(0, input_ids.shape[0], batch_size):
             batch = input_ids[i : i + batch_size]
             outputs = transformer(batch)
-            # last_hidden_state: [B, seq_len, d] — only the final layer
             last_hidden = outputs.last_hidden_state
-            # Take the final token position: [B, d]
             h = last_hidden[:, -1, :].detach()
             all_h.append(h)
     return torch.cat(all_h, dim=0)
@@ -77,24 +73,16 @@ def extract_hidden_states(model, input_ids: torch.Tensor, batch_size: int = 32) 
 
 def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
     """
-    Compute the normalized soft value function:
-        V(s) = beta * [ logsumexp(Q(s,a')/beta) - log(N) ]
+    Compute the soft value function:
+        V(s) = beta * logsumexp(Q(s, a') / beta)
     
-    The raw logsumexp includes a constant log(N) entropy bonus: even when all
-    Q-values are equal at q, logsumexp = q + log(N). This inflates the TD
-    target by ~log(N) every step, creating a persistent bootstrapping gap
-    that drives Q-values upward without bound.
+    This is the standard entropy-regularised value from soft Q-learning
+    (Haarnoja et al., 2017). It appears as the bootstrap term in the
+    discounted soft Bellman equation:
+        Q(s, a) = r + gamma * V(s')
     
-    Subtracting log(N) normalizes against the uniform prior (p_0 = 1/N),
-    matching the free-energy interpretation in Section 2.6 of the spec where
-    the KL is taken against the uniform distribution. With this normalization:
-      - V(s) = 0 when all Q-values are equal (no preference over candidates)
-      - V(s) > 0 when some candidates are better than others
-      - The TD target y = r - rho + V stays centered near r - rho
-    
-    This does NOT affect the Boltzmann policy (softmax is shift-invariant),
-    and does NOT affect the relative ordering of Q-values. It only affects
-    the absolute scale of the bootstrap target.
+    The discount factor gamma provides Bellman contraction, keeping Q-values
+    bounded without needing centering or average-reward subtraction.
     
     Args:
         q_values: [N, 1] Q-values for all candidates.
@@ -104,8 +92,7 @@ def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
         Scalar soft value V(s).
     """
     q = q_values.squeeze(-1)  # [N]
-    n = q.shape[0]
-    return beta * (torch.logsumexp(q / beta, dim=0) - math.log(n))
+    return beta * torch.logsumexp(q / beta, dim=0)
 
 
 def boltzmann_sample(q_values: torch.Tensor, beta: float) -> int:
@@ -125,4 +112,3 @@ def boltzmann_sample(q_values: torch.Tensor, beta: float) -> int:
     probs = torch.softmax(logits, dim=0)
     action = torch.multinomial(probs, num_samples=1).item()
     return action
-

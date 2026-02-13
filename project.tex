@@ -30,7 +30,7 @@ We propose an algorithm that enables language models to learn what data to learn
     \item Q-network $Q_\phi$ with parameters $\phi$, implemented as a 2-layer MLP ($d \to 32 \to 1$) reading the base model's residual stream (see Section~\ref{sec:qnet})
     \item Boltzmann temperature $\beta > 0$ controlling exploration
     \item Learning rate $\alpha$ for the LM gradient step; learning rate $\eta$ for the Q-network update
-    \item Average reward estimate $\rho \in \mathbb{R}$, updated by exponential moving average with rate $\tau$
+    \item Discount factor $\gamma \in (0, 1)$ controlling the effective planning horizon
     \item Gradient clipping threshold $G$ (max global norm; applied to both LM and Q-network gradient steps)
 \end{itemize}
 
@@ -61,30 +61,30 @@ The Q-network reads the base model's internal representations to assess candidat
 
 The hidden state $h_x$ implicitly encodes both the model's current state (through $\theta_k$, which determines the representations) and the identity of the candidate (through the input $x$). By detaching $h_x$, we ensure that $\theta$ is updated only by the language modeling objective, while $\phi$ is updated only by the TD loss. This prevents the co-adaptation instability that arises when value gradients distort the base model's representations.
 
-\subsection{Average Reward Formulation}\label{sec:avg}
+\subsection{Discounted Soft Bellman Equation}\label{sec:discount}
 
-With absolute log-probability rewards, the cumulative return $\sum_k r_k$ grows without bound. Rather than introducing an artificial discount factor, we subtract a running estimate of the average reward $\rho$ from the TD target. The \emph{differential} Q-function satisfies:
+The Q-function satisfies the discounted soft Bellman equation:
 \begin{equation}\label{eq:bellman}
-    Q(s_k, a_k) = r_k - \rho + \beta \log \sum_{a'} \exp\bigl(Q(s_{k+1}, a') / \beta\bigr).
+    Q(s_k, a_k) = r_k + \gamma\, \beta \log \sum_{a'} \exp\bigl(Q(s_{k+1}, a') / \beta\bigr),
 \end{equation}
-Subtracting $\rho$ keeps Q-values bounded and centred: they represent how much better or worse an action is relative to recent performance, rather than accumulating unbounded absolute returns.
+where $\gamma \in (0, 1)$ is the discount factor. The discount serves two purposes: it ensures contraction of the Bellman operator (guaranteeing convergence of Q-learning with function approximation), and it defines an effective planning horizon of $\sim 1/(1-\gamma)$ steps over which the Q-function evaluates the consequences of a curriculum choice.
 
-The policy $\pi(a \mid s) \propto \exp(Q(s, a)/\beta)$ is invariant to the value of $\rho$, since the softmax cancels any shared additive shift. The role of $\rho$ is therefore purely numerical: it prevents the MLP's outputs from drifting to large absolute values where gradients saturate. In practice, $\rho$ is maintained as an exponential moving average of observed rewards:
-\begin{equation}\label{eq:rho}
-    \rho \;\leftarrow\; (1 - \tau)\,\rho + \tau\, r_k.
+The soft value function is:
+\begin{equation}
+    V(s) = \beta \log \sum_{a'} \exp\bigl(Q(s, a') / \beta\bigr),
 \end{equation}
-A stale or imprecise $\rho$ does not affect the policy or the relative ordering of Q-values; it only affects the absolute scale of the MLP's output.
+so the Bellman equation reads $Q(s_k, a_k) = r_k + \gamma\, V(s_{k+1})$. At convergence, $Q(s, a)$ represents the discounted sum of future rewards from choosing $a$ in state $s$ and following the Boltzmann policy thereafter. With $\gamma = 0.99$, the effective horizon is $\sim\!100$ steps: the Q-function learns which training examples will lead to the best held-out performance over the next $\sim\!100$ gradient updates.
 
-This formulation eliminates the discount factor $\gamma$ entirely. The discount factor has no natural interpretation in the curriculum setting---there is no reason to value early learning more than late learning---and exists in standard RL only to ensure contraction of the Bellman operator.
+The discount factor bounds the Q-values: since $|r_k| \le R_{\max}$, we have $|Q| \le R_{\max}/(1 - \gamma)$. For per-token log-probabilities ($R_{\max} \approx 4$) and $\gamma = 0.99$, this gives $|Q| \le 400$, which is well within the representable range of the MLP.
 
 \subsection{Algorithm}\label{sec:algorithm}
 
 The key implementation insight is that each step's forward pass of candidates through the base model serves two purposes: action selection for the \emph{current} step and the bootstrap target for the \emph{previous} step's Q update. This avoids a redundant second forward pass.
 
 \begin{algorithm}[h]
-\caption{Curriculum Selection via Differential Soft Q-Learning}
+\caption{Curriculum Selection via Discounted Soft Q-Learning}
 \begin{algorithmic}[1]
-\State \textbf{Initialise:} LM parameters $\theta$; Q-network parameters $\phi$; average reward $\rho \gets 0$
+\State \textbf{Initialise:} LM parameters $\theta$; Q-network parameters $\phi$
 \Statex
 \State \textcolor{gray}{\textit{// Bootstrap step (no Q update)}}
 \State $C_0 \gets \textsc{NextBatch}(\text{stream}, N)$
@@ -94,7 +94,6 @@ The key implementation insight is that each step's forward pass of candidates th
 \State $h_{\text{prev}} \gets H_0[a_0]$ \Comment{Store hidden state of selected action}
 \State $\theta \gets \textsc{SGDStep}(\theta, C_0[a_0], \alpha, G)$ \Comment{LM update, clipped}
 \State $r_{\text{prev}} \gets \frac{1}{M}\log p_\theta(\hat{D}_0)$ \Comment{Reward after update}
-\State $\rho \gets r_{\text{prev}}$
 \Statex
 \For{$k = 1, 2, \ldots$} \textcolor{gray}{\textit{// Main loop}}
     \State $C_k \gets \textsc{NextBatch}(\text{stream}, N)$
@@ -103,7 +102,7 @@ The key implementation insight is that each step's forward pass of candidates th
     \Statex
     \State \textcolor{gray}{\textit{// Q update for previous transition (uses current forward pass as bootstrap)}}
     \State $V_{k} \gets \beta \log \sum_{a'} \exp\bigl(q_k[a'] / \beta\bigr)$ \Comment{Soft value of current state}
-    \State $y \gets r_{\text{prev}} - \rho + V_{k}$ \Comment{TD target, stop-gradient}
+    \State $y \gets r_{\text{prev}} + \gamma\, V_{k}$ \Comment{TD target, stop-gradient}
     \State $\hat{q} \gets Q_\phi(h_{\text{prev}})$ \Comment{Re-evaluate previous action with current $\phi$}
     \State Update $\phi$ to minimise $\frac{1}{2}(\hat{q} - y)^2$, clipped to $\|\nabla\| \le G$
     \Statex
@@ -114,7 +113,6 @@ The key implementation insight is that each step's forward pass of candidates th
     \State \textcolor{gray}{\textit{// LM update and reward}}
     \State $\theta \gets \textsc{SGDStep}(\theta, C_k[a_k], \alpha, G)$
     \State $r_k \gets \frac{1}{M}\log p_\theta(\hat{D}_k)$ \Comment{Fresh $\hat{D}_k \subset D$, reward after update}
-    \State $\rho \gets (1 - \tau)\,\rho + \tau\, r_k$
     \State $r_{\text{prev}} \gets r_k$
 \EndFor
 \end{algorithmic}
@@ -141,12 +139,6 @@ The first term encourages selecting high-value candidates; the second encourages
     \log p(\text{optimal} \mid s) \;\geq\; \mathbb{E}_{x \sim \pi}\!\left[\frac{Q(s, x)}{\beta}\right] - \mathrm{KL}(\pi \,\|\, p_0).
 \end{equation}
 The Boltzmann policy makes this bound tight. The soft value $V(s) = \beta \log \sum_x \exp(Q(s,x)/\beta)$---which appears as the bootstrap term in the TD target---is the log-evidence, measuring the total accessible value in the current candidate batch.
-
-\paragraph{Gradient alignment.} To first order in $\alpha$, the one-step held-out improvement is:
-\begin{equation}
-    r_{k} - r_{k-1} \;\approx\; \alpha\, \nabla_\theta \log p_\theta(D)^\top \nabla_\theta \log p_\theta(a_{k-1}).
-\end{equation}
-The Q-function is therefore learning to predict which training examples have gradients aligned with the held-out set---not only at the current step, but accounting for how the gradient landscape will change over subsequent updates.
 
 \section{Evaluation}
 
@@ -176,7 +168,7 @@ Beyond aggregate metrics, we will examine:
     \item \textbf{Curriculum structure:} Does the learned curriculum exhibit interpretable patterns? Developmental stages? Topic clustering?
     \item \textbf{Exploration dynamics:} How does the policy entropy evolve over training? Does the temperature $\beta$ produce reasonable exploration?
     \item \textbf{Q-function interpretability:} Which candidates receive high Q-values at different stages of training? Does the Q-function learn to identify examples that are valuable given the model's current state?
-    \item \textbf{Average reward dynamics:} How does $\rho$ evolve over training? A rising $\rho$ indicates the model is improving; the rate of rise measures curriculum effectiveness. Comparison of $\rho$ trajectories across methods is a direct measure of sample efficiency.
+    \item \textbf{Q-value dynamics:} How do Q-values evolve over training? Convergence of Q-values indicates the value function has stabilised; the spread (standard deviation) reflects how strongly the Q-function discriminates between candidates.
 \end{itemize}
 
 \section{Relation to Prior Work}
@@ -191,11 +183,11 @@ MAML (Finn et al., 2017) learns initializations for fast adaptation. We share th
 
 \subsection{RL as Inference}
 
-The control-as-inference framework (Levine, 2018; Rawlik et al., 2013) casts optimal control as probabilistic inference, with the Q-function serving as an energy function and the optimal policy as the corresponding Boltzmann distribution. Our algorithm instantiates this framework in the curriculum selection setting: the Q-network provides unnormalized log-probabilities over actions, and the Boltzmann policy is derived analytically without requiring a separate policy network. This is the soft Q-learning approach of Haarnoja et al.\ (2017), extended to the average reward setting.
+The control-as-inference framework (Levine, 2018; Rawlik et al., 2013) casts optimal control as probabilistic inference, with the Q-function serving as an energy function and the optimal policy as the corresponding Boltzmann distribution. Our algorithm instantiates this framework in the curriculum selection setting: the Q-network provides unnormalized log-probabilities over actions, and the Boltzmann policy is derived analytically without requiring a separate policy network. This is the soft Q-learning approach of Haarnoja et al.\ (2017), applied to curriculum selection with a standard discount factor for Bellman contraction.
 
-\subsection{Average Reward RL}
+\subsection{Soft Q-Learning}
 
-The average reward formulation (Mahadevan, 1996; Schwartz, 1993) optimises the long-run reward rate rather than discounted return. It is the natural framework when there is no preferred time scale and the discount factor would be an arbitrary hyperparameter. Our use of differential Q-values with a soft (entropy-regularised) Bellman equation combines the average reward framework with the maximum entropy RL of Haarnoja et al., avoiding both the unbounded returns of the undiscounted setting and the arbitrary time preference imposed by discounting.
+Soft Q-learning (Haarnoja et al., 2017) augments the standard Bellman equation with an entropy bonus, yielding a Boltzmann policy without requiring a separate policy network. SAC (Haarnoja et al., 2018) extends this to continuous actions with a learned temperature. Our setting is simpler: the action space is a finite set of $N$ candidates, so the Boltzmann policy and soft value can be computed exactly via softmax and logsumexp. The discount factor $\gamma$ provides the standard Bellman contraction guarantee, ensuring Q-values remain bounded under function approximation.
 
 \subsection{Intrinsic Motivation}
 
