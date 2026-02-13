@@ -1,0 +1,1 @@
+{"_type": "config", "method": "q_learning", "timestamp": "20260213_060448", "config": {"method_name": "q_learning", "model_name": "gpt2", "dataset_name": "openwebtext", "seq_len": 1024, "num_candidates": 64, "held_out_subset_size": 256, "held_out_total_size": 4096, "beta": 1.0, "q_lr": 0.001, "tau": 0.01, "lm_lr": 5e-05, "grad_clip": 1.0}}
