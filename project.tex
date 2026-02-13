@@ -1,0 +1,228 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+
+\title{\textbf{Learning to Learn: Curriculum Selection via Soft Q-Learning for Sample-Efficient Language Models}}
+\author{Scott Viteri \and Damir Vrabac}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+
+We propose an algorithm that enables language models to learn what data to learn from. Rather than training on randomly sampled data, the model takes actions that select training examples, receiving reward based on how well it currently predicts held-out data. A Q-function, parameterized as a small network reading the language model's internal representations, learns to predict the long-run value of each candidate. The policy is derived from the Q-function via a Boltzmann distribution, eliminating the need for a separate policy network. The core hypothesis is that this learned curriculum selection will yield significantly better sample efficiency than random or heuristic curricula.
+
+\section{Technical Approach}
+
+\subsection{Setup}
+
+\begin{itemize}[nosep]
+    \item Language model (GPT-2) with parameters $\theta$, hidden dimension $d = 768$
+    \item Streaming data source, yielding fresh batches of $N$ candidate context windows each step
+    \item Fixed held-out evaluation set $D$, large; a fresh random subset $\hat{D} \subset D$ of size $M$ is sampled each step for reward computation
+    \item Q-network $Q_\phi$ with parameters $\phi$, implemented as a 2-layer MLP ($d \to 32 \to 1$) reading the base model's residual stream (see Section~\ref{sec:qnet})
+    \item Boltzmann temperature $\beta > 0$ controlling exploration
+    \item Learning rate $\alpha$ for the LM gradient step; learning rate $\eta$ for the Q-network update
+    \item Average reward estimate $\rho \in \mathbb{R}$, updated by exponential moving average with rate $\tau$
+    \item Gradient clipping threshold $G$ (max global norm; applied to both LM and Q-network gradient steps)
+\end{itemize}
+
+\subsection{State, Action, and Reward}\label{sec:sar}
+
+The state $s_k$ is the current model parameters $\theta_k$, which determine the model's representations and therefore the features available to the Q-network. In practice, $s_k$ is never represented explicitly---it is accessed implicitly through the base model's hidden states when candidates are forwarded through it (Section~\ref{sec:qnet}).
+
+The action $a_k \in C_k$ is the choice of which training example to train on at step $k$, where $C_k$ is the batch of $N$ candidates available at that step. Since data is streamed, each step presents a fresh candidate batch, and each candidate is seen at most once. The Q-network generalises across batches via the base model's hidden-state representation.
+
+The reward is the held-out log-probability \emph{after} the training update:
+\begin{equation}\label{eq:reward}
+    r_k = \frac{1}{M}\log p_{\theta_{k+1}}(\hat{D}_k),
+\end{equation}
+where $\hat{D}_k$ is a fresh random subset of $D$ of size $M$, and $\theta_{k+1}$ results from training on $a_k$. This measures the model's absolute predictive fitness as a consequence of the selected action. Resampling $\hat{D}_k$ each step prevents the Q-function from overfitting to a fixed evaluation subset. The cumulative objective $\sum_k r_k$ is the integral of the learning curve: it penalises every step spent with poor predictions, rewarding curricula that reach high performance quickly. Equivalently, maximising $\sum_k r_k$ minimises cumulative regret $\sum_k (L^* - r_k)$ where $L^*$ is the best achievable log-probability.
+
+\subsection{Q-Network Architecture}\label{sec:qnet}
+
+The Q-network reads the base model's internal representations to assess candidate value. For each candidate $x \in C_k$:
+\begin{enumerate}[nosep]
+    \item Forward $x$ through the base model with parameters $\theta_k$, extracting the last-layer hidden state at the final token position: $h_x = \texttt{last\_hidden}(\theta_k, x) \in \mathbb{R}^{d}$.
+    \item Detach $h_x$ from the computation graph (no gradients flow into $\theta$).
+    \item Pass through the Q-network:
+    \begin{equation}
+        Q_\phi(s_k, x) = W_2\, \sigma(W_1\, h_x + b_1) + b_2,
+    \end{equation}
+    where $\phi = \{W_1 \in \mathbb{R}^{32 \times d},\; b_1 \in \mathbb{R}^{32},\; W_2 \in \mathbb{R}^{1 \times 32},\; b_2 \in \mathbb{R}\}$ and $\sigma$ is ReLU.
+\end{enumerate}
+
+The hidden state $h_x$ implicitly encodes both the model's current state (through $\theta_k$, which determines the representations) and the identity of the candidate (through the input $x$). By detaching $h_x$, we ensure that $\theta$ is updated only by the language modeling objective, while $\phi$ is updated only by the TD loss. This prevents the co-adaptation instability that arises when value gradients distort the base model's representations.
+
+\subsection{Average Reward Formulation}\label{sec:avg}
+
+With absolute log-probability rewards, the cumulative return $\sum_k r_k$ grows without bound. Rather than introducing an artificial discount factor, we subtract a running estimate of the average reward $\rho$ from the TD target. The \emph{differential} Q-function satisfies:
+\begin{equation}\label{eq:bellman}
+    Q(s_k, a_k) = r_k - \rho + \beta \log \sum_{a'} \exp\bigl(Q(s_{k+1}, a') / \beta\bigr).
+\end{equation}
+Subtracting $\rho$ keeps Q-values bounded and centred: they represent how much better or worse an action is relative to recent performance, rather than accumulating unbounded absolute returns.
+
+The policy $\pi(a \mid s) \propto \exp(Q(s, a)/\beta)$ is invariant to the value of $\rho$, since the softmax cancels any shared additive shift. The role of $\rho$ is therefore purely numerical: it prevents the MLP's outputs from drifting to large absolute values where gradients saturate. In practice, $\rho$ is maintained as an exponential moving average of observed rewards:
+\begin{equation}\label{eq:rho}
+    \rho \;\leftarrow\; (1 - \tau)\,\rho + \tau\, r_k.
+\end{equation}
+A stale or imprecise $\rho$ does not affect the policy or the relative ordering of Q-values; it only affects the absolute scale of the MLP's output.
+
+This formulation eliminates the discount factor $\gamma$ entirely. The discount factor has no natural interpretation in the curriculum setting---there is no reason to value early learning more than late learning---and exists in standard RL only to ensure contraction of the Bellman operator.
+
+\subsection{Algorithm}\label{sec:algorithm}
+
+The key implementation insight is that each step's forward pass of candidates through the base model serves two purposes: action selection for the \emph{current} step and the bootstrap target for the \emph{previous} step's Q update. This avoids a redundant second forward pass.
+
+\begin{algorithm}[h]
+\caption{Curriculum Selection via Differential Soft Q-Learning}
+\begin{algorithmic}[1]
+\State \textbf{Initialise:} LM parameters $\theta$; Q-network parameters $\phi$; average reward $\rho \gets 0$
+\Statex
+\State \textcolor{gray}{\textit{// Bootstrap step (no Q update)}}
+\State $C_0 \gets \textsc{NextBatch}(\text{stream}, N)$
+\State $H_0 \gets \textsc{DetachedHidden}(\theta, C_0)$ \Comment{$[N, d]$ --- no grad into $\theta$}
+\State $q_0 \gets Q_\phi(H_0)$ \Comment{$[N, 1]$}
+\State $a_0 \gets \textsc{Sample}\bigl(\textsc{Softmax}(q_0 / \beta)\bigr)$
+\State $h_{\text{prev}} \gets H_0[a_0]$ \Comment{Store hidden state of selected action}
+\State $\theta \gets \textsc{SGDStep}(\theta, C_0[a_0], \alpha, G)$ \Comment{LM update, clipped}
+\State $r_{\text{prev}} \gets \frac{1}{M}\log p_\theta(\hat{D}_0)$ \Comment{Reward after update}
+\State $\rho \gets r_{\text{prev}}$
+\Statex
+\For{$k = 1, 2, \ldots$} \textcolor{gray}{\textit{// Main loop}}
+    \State $C_k \gets \textsc{NextBatch}(\text{stream}, N)$
+    \State $H_k \gets \textsc{DetachedHidden}(\theta, C_k)$ \Comment{Serves dual purpose below}
+    \State $q_k \gets Q_\phi(H_k)$
+    \Statex
+    \State \textcolor{gray}{\textit{// Q update for previous transition (uses current forward pass as bootstrap)}}
+    \State $V_{k} \gets \beta \log \sum_{a'} \exp\bigl(q_k[a'] / \beta\bigr)$ \Comment{Soft value of current state}
+    \State $y \gets r_{\text{prev}} - \rho + V_{k}$ \Comment{TD target, stop-gradient}
+    \State $\hat{q} \gets Q_\phi(h_{\text{prev}})$ \Comment{Re-evaluate previous action with current $\phi$}
+    \State Update $\phi$ to minimise $\frac{1}{2}(\hat{q} - y)^2$, clipped to $\|\nabla\| \le G$
+    \Statex
+    \State \textcolor{gray}{\textit{// Action selection for current step}}
+    \State $a_k \gets \textsc{Sample}\bigl(\textsc{Softmax}(q_k / \beta)\bigr)$
+    \State $h_{\text{prev}} \gets H_k[a_k]$
+    \Statex
+    \State \textcolor{gray}{\textit{// LM update and reward}}
+    \State $\theta \gets \textsc{SGDStep}(\theta, C_k[a_k], \alpha, G)$
+    \State $r_k \gets \frac{1}{M}\log p_\theta(\hat{D}_k)$ \Comment{Fresh $\hat{D}_k \subset D$, reward after update}
+    \State $\rho \gets (1 - \tau)\,\rho + \tau\, r_k$
+    \State $r_{\text{prev}} \gets r_k$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Computational cost per step.} One forward pass of $N$ candidates through the base model (batched, no gradient); one forward-backward pass of the selected example for LM training; one forward pass of $M$ held-out examples for reward; one MLP forward-backward for the Q update. The candidate forward pass dominates; the MLP and reward computations are comparatively cheap.
+
+\paragraph{Staleness.} The Q update at step $k$ uses $q_k$ (computed before the $\phi$ update) for both the bootstrap target and action selection. This one-step staleness is standard in online Q-learning and negligible in practice given the small MLP learning rate $\eta$.
+
+\subsection{Interpretation as Free-Energy Minimisation}\label{sec:freeenergy}
+
+The Boltzmann policy is the solution to a free-energy minimisation problem at each state:
+\begin{equation}
+    \pi^*(\cdot \mid s) = \arg\min_\pi \;\Bigl[\; -\mathbb{E}_{x \sim \pi}\bigl[Q_\phi(s, x)\bigr] + \beta\, \mathrm{KL}\bigl(\pi \,\|\, p_0\bigr) \;\Bigr],
+\end{equation}
+where $p_0$ is the uniform distribution over $C_k$. Since $p_0$ is uniform, $\mathrm{KL}(\pi \| p_0) = \log N - H(\pi)$, and the objective reduces (up to constants) to:
+\begin{equation}
+    \pi^*(\cdot \mid s) = \arg\min_\pi \;\Bigl[\; -\mathbb{E}_{x \sim \pi}\bigl[Q_\phi(s, x)\bigr] - \beta\, H(\pi) \;\Bigr].
+\end{equation}
+The first term encourages selecting high-value candidates; the second encourages exploration. The temperature $\beta$ controls the tradeoff.
+
+\paragraph{ELBO interpretation.} Define a latent variable model where the ``evidence'' is the event that the current trajectory is optimal, with likelihood $p(\text{optimal} \mid x) \propto \exp(Q(s, x)/\beta)$. The policy $\pi$ acts as a variational posterior over actions, and the free energy is the negative ELBO:
+\begin{equation}
+    \log p(\text{optimal} \mid s) \;\geq\; \mathbb{E}_{x \sim \pi}\!\left[\frac{Q(s, x)}{\beta}\right] - \mathrm{KL}(\pi \,\|\, p_0).
+\end{equation}
+The Boltzmann policy makes this bound tight. The soft value $V(s) = \beta \log \sum_x \exp(Q(s,x)/\beta)$---which appears as the bootstrap term in the TD target---is the log-evidence, measuring the total accessible value in the current candidate batch.
+
+\paragraph{Gradient alignment.} To first order in $\alpha$, the one-step held-out improvement is:
+\begin{equation}
+    r_{k} - r_{k-1} \;\approx\; \alpha\, \nabla_\theta \log p_\theta(D)^\top \nabla_\theta \log p_\theta(a_{k-1}).
+\end{equation}
+The Q-function is therefore learning to predict which training examples have gradients aligned with the held-out set---not only at the current step, but accounting for how the gradient landscape will change over subsequent updates.
+
+\section{Evaluation}
+
+\subsection{Primary Metric: Sample Efficiency}
+
+The central question is: how many training examples does the model need to reach a given performance level?
+
+We will measure:
+\begin{itemize}[nosep]
+    \item Perplexity on a fixed evaluation set as a function of training examples seen
+    \item Performance on downstream tasks (e.g., MMLU, HellaSwag) as a function of training examples
+\end{itemize}
+
+\subsection{Baselines}
+
+\begin{itemize}[nosep]
+    \item \textbf{Random curriculum:} Uniform sampling from candidates
+    \item \textbf{Loss-based curriculum:} Prioritise high-loss examples
+    \item \textbf{Uncertainty-based curriculum:} Prioritise examples with high model uncertainty
+    \item \textbf{Competence-based curriculum:} Examples ordered by difficulty (requires difficulty labels)
+\end{itemize}
+
+\subsection{Analysis}
+
+Beyond aggregate metrics, we will examine:
+\begin{itemize}[nosep]
+    \item \textbf{Curriculum structure:} Does the learned curriculum exhibit interpretable patterns? Developmental stages? Topic clustering?
+    \item \textbf{Exploration dynamics:} How does the policy entropy evolve over training? Does the temperature $\beta$ produce reasonable exploration?
+    \item \textbf{Q-function interpretability:} Which candidates receive high Q-values at different stages of training? Does the Q-function learn to identify examples that are valuable given the model's current state?
+    \item \textbf{Average reward dynamics:} How does $\rho$ evolve over training? A rising $\rho$ indicates the model is improving; the rate of rise measures curriculum effectiveness. Comparison of $\rho$ trajectories across methods is a direct measure of sample efficiency.
+\end{itemize}
+
+\section{Relation to Prior Work}
+
+\subsection{Curriculum Learning}
+
+Graves et al.\ (2017) use multi-armed bandits to select tasks; Jiang et al.\ (2018) train a separate ``mentor'' network to weight examples. Our approach differs by using the language model's own representations as features for the Q-function and applying soft Q-learning with temporal credit assignment, rather than treating selection as a stateless bandit problem.
+
+\subsection{Meta-Learning}
+
+MAML (Finn et al., 2017) learns initializations for fast adaptation. We share the computational structure---reasoning about the effect of gradient updates---but learn \emph{what} to train on rather than \emph{where} to start.
+
+\subsection{RL as Inference}
+
+The control-as-inference framework (Levine, 2018; Rawlik et al., 2013) casts optimal control as probabilistic inference, with the Q-function serving as an energy function and the optimal policy as the corresponding Boltzmann distribution. Our algorithm instantiates this framework in the curriculum selection setting: the Q-network provides unnormalized log-probabilities over actions, and the Boltzmann policy is derived analytically without requiring a separate policy network. This is the soft Q-learning approach of Haarnoja et al.\ (2017), extended to the average reward setting.
+
+\subsection{Average Reward RL}
+
+The average reward formulation (Mahadevan, 1996; Schwartz, 1993) optimises the long-run reward rate rather than discounted return. It is the natural framework when there is no preferred time scale and the discount factor would be an arbitrary hyperparameter. Our use of differential Q-values with a soft (entropy-regularised) Bellman equation combines the average reward framework with the maximum entropy RL of Haarnoja et al., avoiding both the unbounded returns of the undiscounted setting and the arbitrary time preference imposed by discounting.
+
+\subsection{Intrinsic Motivation}
+
+Our objective relates to compression progress (Schmidhuber) and active inference, but avoids the memory requirements of the former and the dark room problem of the latter by using a fixed held-out set as a proxy for predictive success. The absolute log-probability reward~\eqref{eq:reward} provides a direct measure of predictive fitness, connecting to the epistemic homeostasis motivation: the agent is penalised for \emph{being} in a state of poor prediction, not merely for failing to improve.
+
+\subsection{Connection to Prior Work}
+
+This proposal builds directly on Markovian Transformers for Informative Language Modeling (\url{https://arxiv.org/abs/2404.18988}), which introduces a framework for training language models with RL to produce causally load-bearing Chain-of-Thought reasoning. Both projects share a common structure: use RL to learn intermediate representations that improve prediction on held-out data. In the Markovian Transformers work, the learned object is a CoT:
+\[
+\text{Question} \to \text{CoT} \to \text{Answer}
+\]
+In the current proposal, the learned object is a curriculum:
+\[
+\text{Model State} \to \text{Selected Data} \to \text{Improved Predictions}
+\]
+The Markovian Transformers work demonstrates that this general approach is tractable and yields large gains on reasoning benchmarks (e.g., GSM8K: 19.6\% $\to$ 57.1\%). The current proposal extends this framework from learning \emph{what to say} to learning \emph{what to study}.
+
+\section{Broader Motivation}
+
+Language models trained to predict text develop remarkable capabilities from a simple objective. Yet they require extensive post-training to behave agentically and arguably lack a kind of global coherence. One hypothesis: the training process is purely observational---the model never takes actions that affect what it observes.
+
+This project is a stepping stone toward studying whether learned curriculum selection produces qualitatively different agents. The immediate goal is demonstrating sample efficiency gains. The longer-term question is whether controlling one's own learning process contributes to the coherence and agency that current models seem to lack.
+
+\subsection{Long-Term Direction: Formalizing Homeostasis}
+
+Biological agents are shaped by survival pressures. Hunger, pain, and fatigue are not arbitrary reward signals---they are tied to the organism's continued existence. Current approaches to intrinsic motivation (curiosity, empowerment, compression progress) capture aspects of adaptive behavior but lack this grounding in self-preservation.
+
+A long-term goal of this research program is to formalize homeostasis and survival into a simple, biologically plausible metric that could serve as a foundation for intrinsic motivation in artificial systems. The current project---learning to select data that improves future prediction---is a minimal step in this direction: the agent takes actions that maintain its predictive capacity, a kind of epistemic homeostasis. The absolute reward formulation makes this connection explicit: the agent is directly penalised for poor predictive fitness at every moment, not merely for failing to improve.
+
+\end{document}
