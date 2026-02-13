@@ -43,7 +43,7 @@ def compute_lm_loss(model: GPT2LMHeadModel, input_ids: torch.Tensor) -> torch.Te
 def compute_held_out_reward(
     model: GPT2LMHeadModel,
     held_out_subset: torch.Tensor,
-    eval_batch_size: int = 128,
+    eval_batch_size: int = 16,
 ) -> float:
     """
     Compute reward: average log-probability on held-out subset.
@@ -409,7 +409,7 @@ class AutodidactTrainer:
         """Evaluate on the full held-out set. Returns (reward, perplexity)."""
         self.model.eval()
         total_loss = 0.0
-        batch_size = 128  # H100 can handle large eval batches
+        batch_size = 16  # Keep logits tensor manageable: [16, seq_len, 50257]
         n = held_out.data.shape[0]
         n_batches = 0
         with torch.no_grad():
@@ -593,7 +593,7 @@ class BaselineTrainer:
     def _full_eval(self, held_out: HeldOutSet) -> tuple:
         self.model.eval()
         total_loss = 0.0
-        batch_size = 128
+        batch_size = 16
         n = held_out.data.shape[0]
         n_batches = 0
         with torch.no_grad():

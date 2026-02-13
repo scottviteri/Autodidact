@@ -40,25 +40,34 @@ class QNetwork(nn.Module):
         return self.net(h)
 
 
-def extract_hidden_states(model, input_ids: torch.Tensor) -> torch.Tensor:
+def extract_hidden_states(model, input_ids: torch.Tensor, batch_size: int = 16) -> torch.Tensor:
     """
     Forward candidates through the base model and extract last-layer hidden 
     states at the final token position, detached from the computation graph.
     
+    Processes in mini-batches to avoid OOM: each forward pass with
+    output_hidden_states=True stores all 13 layers of hidden states plus
+    logits, so [N, seq_len, vocab_size] can be huge for large N.
+    
     Args:
         model: HuggingFace GPT-2 model.
         input_ids: [N, seq_len] token IDs.
+        batch_size: Mini-batch size for forward passes.
     
     Returns:
         h: [N, d] detached hidden states.
     """
+    all_h = []
     with torch.no_grad():
-        outputs = model(input_ids, output_hidden_states=True)
-    # Last layer hidden states: [N, seq_len, d]
-    last_hidden = outputs.hidden_states[-1]
-    # Take the final token position for each example: [N, d]
-    h = last_hidden[:, -1, :]
-    return h.detach()
+        for i in range(0, input_ids.shape[0], batch_size):
+            batch = input_ids[i : i + batch_size]
+            outputs = model(batch, output_hidden_states=True)
+            # Last layer hidden states: [B, seq_len, d]
+            last_hidden = outputs.hidden_states[-1]
+            # Take the final token position: [B, d]
+            h = last_hidden[:, -1, :].detach()
+            all_h.append(h)
+    return torch.cat(all_h, dim=0)
 
 
 def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
