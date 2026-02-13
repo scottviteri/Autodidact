@@ -122,6 +122,50 @@ The key implementation insight is that each step's forward pass of candidates th
 
 \paragraph{Staleness.} The Q update at step $k$ uses $q_k$ (computed before the $\phi$ update) for both the bootstrap target and action selection. This one-step staleness is standard in online Q-learning and negligible in practice given the small MLP learning rate $\eta$.
 
+\subsection{Soft Mixture Training Variant}\label{sec:softmixture}
+
+In the base algorithm (Section~\ref{sec:algorithm}), the Boltzmann policy samples a single action $a_k \in C_k$ and the LM trains on that one example. This is sample-inefficient in a specific sense: at every step, $N$ candidates are already forwarded through the base model for Q-scoring, but only one of them contributes to the LM gradient update.
+
+\paragraph{Expected gradient under the policy.}
+An alternative is to train the LM on a \emph{policy-weighted mixture} of all $N$ candidates. Define the Boltzmann weights:
+\begin{equation}\label{eq:mixture_weights}
+    \pi_i = \frac{\exp(Q_\phi(s_k, x_i) / \beta)}{\sum_{j=1}^N \exp(Q_\phi(s_k, x_j) / \beta)}, \qquad x_i \in C_k.
+\end{equation}
+The LM loss becomes:
+\begin{equation}\label{eq:mixture_loss}
+    \mathcal{L}_{\text{mix}}(\theta; C_k) = \sum_{i=1}^{N} \pi_i \, \ell(\theta, x_i),
+\end{equation}
+where $\ell(\theta, x_i)$ is the per-token cross-entropy loss on candidate $x_i$. The LM gradient step is then:
+\begin{equation}
+    \theta_{k+1} = \theta_k - \alpha\, \nabla_\theta \mathcal{L}_{\text{mix}}(\theta_k; C_k).
+\end{equation}
+This is precisely the \emph{expected gradient} under the Boltzmann policy:
+\begin{equation}
+    \nabla_\theta \mathcal{L}_{\text{mix}} = \mathbb{E}_{x \sim \pi(\cdot \mid s_k)}\!\bigl[\nabla_\theta \ell(\theta_k, x)\bigr].
+\end{equation}
+In the base algorithm, the LM gradient is a single-sample Monte Carlo estimate of this expectation. The soft mixture computes it exactly, eliminating the variance from action sampling.
+
+\paragraph{Q-learning is unchanged.}
+The Q-network update proceeds exactly as in Section~\ref{sec:algorithm}: a discrete action $a_k$ is still sampled from the Boltzmann policy, its hidden state $h_{\text{prev}}$ is stored, and the standard TD update is applied at the next step. The Q-function continues to satisfy the discounted soft Bellman equation~\eqref{eq:bellman}. The only change is in how the environment \emph{transitions}: the LM parameters are updated via the full mixture rather than a single example.
+
+\paragraph{Off-policy interpretation.}
+From the Q-learner's perspective, the situation is analogous to off-policy learning. The Q-learner observes: ``I selected action $a_k$, the environment transitioned to state $s_{k+1}$, and I received reward $r_k$.'' It does not need to know that the transition was caused by a mixture-weighted gradient step rather than a single-example step. Q-learning is inherently off-policy---the Bellman backup $Q(s, a) = r + \gamma V(s')$ is valid regardless of the behavior policy that generated the transition, as long as $r$ and $s'$ are the actual observed reward and next state.
+
+In this case, the ``behavior policy'' (the mixture-weighted LM update) is a smooth, deterministic function of the same Boltzmann policy that the Q-learner is evaluating. Over many steps, the Q-function converges to predict the value of upweighting a given candidate within the mixture---which is exactly the marginal contribution signal needed to set the mixture weights well.
+
+\paragraph{Computational cost.}
+The $N$ candidate forward passes for Q-scoring are already performed (under \texttt{torch.no\_grad}). The soft mixture additionally requires $N$ forward-backward passes through the full model for loss computation, processed in mini-batches with gradient accumulation. This replaces the single forward-backward pass of the base algorithm. The cost increase is a factor of $\sim\!N$ in the LM training portion of each step, but the LM training step was already cheap relative to the $N$ candidate forward passes and $M$ held-out forward passes. The net effect is roughly a $2\times$ increase in total step time (the candidate extraction forward passes, which dominate, are shared).
+
+\paragraph{When to use soft mixture training.}
+The soft mixture variant is most beneficial when:
+\begin{itemize}[nosep]
+    \item The number of candidates $N$ is moderate (the gradient accumulation cost scales linearly in $N$).
+    \item Variance reduction matters: early in training when Q-values are noisy, the expected gradient is more stable than a single-sample estimate.
+    \item The effective batch size increase is desirable: the mixture-weighted update is equivalent to training on a soft batch of $\sim\!1/\|\pi\|_2^2$ effective examples per step (the inverse of the collision probability of the policy distribution).
+\end{itemize}
+
+The flag \texttt{--soft\_mixture} enables this variant. When disabled (the default), the algorithm reverts to single-action selection as in Algorithm~1.
+
 \subsection{Interpretation as Free-Energy Minimisation}\label{sec:freeenergy}
 
 The Boltzmann policy is the solution to a free-energy minimisation problem at each state:

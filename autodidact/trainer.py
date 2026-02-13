@@ -119,6 +119,9 @@ class AutodidactTrainer:
         wandb_project: str = "autodidact",
         # Device
         device: Optional[str] = None,
+        # Soft mixture training
+        soft_mixture: bool = False,
+        mixture_batch_size: int = 8,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"Using device: {self.device}")
@@ -155,6 +158,10 @@ class AutodidactTrainer:
         self.dataset_name = dataset_name
         self.held_out_total_size = held_out_total_size
 
+        # --- Soft mixture ---
+        self.soft_mixture = soft_mixture
+        self.mixture_batch_size = mixture_batch_size
+
         # --- Logging ---
         self.log_dir = log_dir
         self.use_wandb = use_wandb
@@ -162,7 +169,7 @@ class AutodidactTrainer:
 
         # Store config dict for logger header
         self._config_dict = {
-            "method_name": "q_learning",
+            "method_name": "q_learning_mixture" if soft_mixture else "q_learning",
             "model_name": model_name,
             "dataset_name": dataset_name,
             "seq_len": seq_len,
@@ -177,6 +184,8 @@ class AutodidactTrainer:
             "q_grad_clip": q_grad_clip,
             "lm_lr": lm_lr,
             "grad_clip": grad_clip,
+            "soft_mixture": soft_mixture,
+            "mixture_batch_size": mixture_batch_size,
         }
 
         if use_wandb:
@@ -194,6 +203,65 @@ class AutodidactTrainer:
         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip).item()
         self.lm_optimizer.step()
         return loss.item(), grad_norm
+
+    def _lm_step_mixture(
+        self,
+        candidates: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple:
+        """
+        Perform one LM gradient step on the policy-weighted mixture of all candidates.
+
+        Instead of training on a single selected example, we compute per-candidate
+        losses and weight them by the Boltzmann policy pi = softmax(Q/beta).
+        Gradients are accumulated in mini-batches to control memory.
+
+        The weighted loss is:
+            L = sum_i  pi_i * loss(x_i)
+
+        This is the expected gradient under the policy, which is a variance-reduced
+        alternative to sampling a single action. The Q-learning side is unchanged;
+        this only affects how the LM parameters are updated.
+
+        Args:
+            candidates: [N, seq_len] all candidate token IDs.
+            weights: [N] policy weights (should sum to 1, i.e. softmax(Q/beta)).
+
+        Returns:
+            (weighted_loss_value, grad_norm_before_clip)
+        """
+        self.lm_optimizer.zero_grad()
+        N = candidates.shape[0]
+        bs = self.mixture_batch_size
+        weighted_loss_total = 0.0
+
+        for i in range(0, N, bs):
+            batch = candidates[i : i + bs]               # [bs, seq_len]
+            w = weights[i : i + bs]                       # [bs]
+
+            # Compute per-example losses (HF returns mean over tokens per example
+            # when given a batch with labels, but averages across the batch too).
+            # We need per-example losses, so we use reduction='none' manually.
+            outputs = self.model(batch, labels=batch)
+            # outputs.loss is the mean over all tokens in the batch.
+            # We need per-example losses. Recompute from logits:
+            logits = outputs.logits[:, :-1, :].contiguous()   # [bs, seq_len-1, vocab]
+            labels = batch[:, 1:].contiguous()                 # [bs, seq_len-1]
+            per_token_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                reduction='none',
+            ).view(labels.shape)                               # [bs, seq_len-1]
+            per_example_loss = per_token_loss.mean(dim=1)      # [bs]
+
+            # Weighted contribution of this mini-batch
+            mini_loss = (w * per_example_loss).sum()
+            mini_loss.backward()
+            weighted_loss_total += mini_loss.item()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip).item()
+        self.lm_optimizer.step()
+        return weighted_loss_total, grad_norm
 
     def _q_step(
         self,
@@ -238,7 +306,8 @@ class AutodidactTrainer:
         from .data import StreamingTextDataset
 
         # --- Set up logging ---
-        logger = MetricsLogger("q_learning", log_dir=self.log_dir, config=self._config_dict)
+        method_label = "q_learning_mixture" if self.soft_mixture else "q_learning"
+        logger = MetricsLogger(method_label, log_dir=self.log_dir, config=self._config_dict)
         run_dashboard = DashboardPlotter(output_path=str(logger.dashboard_file))
 
         # --- Set up data ---
@@ -272,8 +341,12 @@ class AutodidactTrainer:
 
         h_prev = H_0[a_0]
 
-        # LM update on selected candidate
-        lm_loss, lm_grad_norm = self._lm_step(C_0[a_0].unsqueeze(0))
+        # LM update: mixture of all candidates or single selected candidate
+        if self.soft_mixture:
+            pi_0 = torch.softmax(q_0.squeeze(-1) / self.beta, dim=0).detach()
+            lm_loss, lm_grad_norm = self._lm_step_mixture(C_0, pi_0)
+        else:
+            lm_loss, lm_grad_norm = self._lm_step(C_0[a_0].unsqueeze(0))
 
         # Compute reward after update
         D_hat = held_out.sample_subset(self.held_out_subset_size)
@@ -321,11 +394,19 @@ class AutodidactTrainer:
             td_loss, q_grad_norm = self._q_step(h_prev, r_prev, V_k)
 
             # --- Action selection for current step ---
+            # (Still sample a discrete action for the Q-learning Bellman backup,
+            # even in soft_mixture mode where the LM trains on the full mixture.)
             a_k = boltzmann_sample(q_k, self.beta)
             h_prev = H_k[a_k]
 
-            # --- LM update on selected candidate ---
-            lm_loss, lm_grad_norm = self._lm_step(C_k[a_k].unsqueeze(0))
+            # --- LM update ---
+            if self.soft_mixture:
+                # Train on policy-weighted mixture of all candidates
+                pi_k = torch.softmax(q_k.squeeze(-1) / self.beta, dim=0).detach()
+                lm_loss, lm_grad_norm = self._lm_step_mixture(C_k, pi_k)
+            else:
+                # Train on single selected candidate
+                lm_loss, lm_grad_norm = self._lm_step(C_k[a_k].unsqueeze(0))
 
             # --- Compute reward ---
             D_hat = held_out.sample_subset(self.held_out_subset_size)

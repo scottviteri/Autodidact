@@ -64,6 +64,10 @@ class AutodidactConfig:
     # --- Device ---
     device: Optional[str] = None
 
+    # --- Soft mixture training ---
+    soft_mixture: bool = False       # Train on policy-weighted mixture of all candidates
+    mixture_batch_size: int = 8      # Mini-batch size for gradient-accumulated mixture training
+
     # --- Baselines ---
     run_baselines: bool = False
     baseline_methods: str = "random,loss_based,uncertainty"  # comma-separated
