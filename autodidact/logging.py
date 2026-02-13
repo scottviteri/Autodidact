@@ -3,7 +3,8 @@ Logging and live dashboard for Autodidact training.
 
 Provides:
 - MetricsLogger: Writes every metric to a timestamped JSONL log file.
-- DashboardPlotter: Periodically renders a 4x4 matplotlib figure from the log.
+  Each logger also owns a per-run dashboard PNG (same name as the log, .png).
+- DashboardPlotter: Renders a 4x4 matplotlib figure from one or more logs.
 """
 
 import json
@@ -24,6 +25,9 @@ class MetricsLogger:
     Each run gets a fresh file under logs/ with a timestamp + method name,
     e.g. logs/20260212_143022_q_learning.jsonl
     
+    A matching per-run dashboard is also created:
+    e.g. logs/20260212_143022_q_learning.png
+    
     Every line contains the full metric dict for that step, plus a wall-clock
     timestamp, so we can reconstruct any plot after the fact.
     """
@@ -35,6 +39,8 @@ class MetricsLogger:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.method_name = method_name
         self.log_file = self.log_dir / f"{timestamp}_{method_name}.jsonl"
+        # Per-run dashboard: same stem, .png extension
+        self.dashboard_file = self.log_dir / f"{timestamp}_{method_name}.png"
 
         # Write config as the first line (metadata header)
         header = {
@@ -47,6 +53,7 @@ class MetricsLogger:
             f.write(json.dumps(header) + "\n")
 
         print(f"Logging to: {self.log_file}")
+        print(f"Dashboard:  {self.dashboard_file}")
 
     def log(self, metrics: Dict[str, Any]):
         """Append one metrics dict as a JSONL line."""
@@ -104,8 +111,8 @@ class DashboardPlotter:
     The file is atomically replaced so viewers see a consistent image.
     """
 
-    # Panel layout: (row, col) -> (title, y_key, plot_type)
-    # plot_type: "line", "semilogy", "hist", "scatter"
+    # Panel layout: (title, y_key, plot_type)
+    # plot_type: "line", "semilogy", "hist", "eval_line"
     PANELS = [
         # Row 1
         ("Reward (r_k)",           "reward",               "line"),
@@ -213,4 +220,3 @@ class DashboardPlotter:
         fig.savefig(tmp_path, dpi=120, bbox_inches="tight")
         os.replace(tmp_path, self.output_path)
         plt.close(fig)
-

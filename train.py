@@ -4,7 +4,8 @@ Entry point for Autodidact: Curriculum Selection via Differential Soft Q-Learnin
 
 Each run produces:
     - A timestamped JSONL log file in logs/ with every metric at every step.
-    - A periodically-refreshed dashboard.png (4x4 panel figure) for live monitoring.
+    - A matching per-run dashboard PNG in logs/ (same stem as the log file).
+    - When --run_baselines is used, a combined dashboard overlaying all methods.
 
 Usage:
     # Run Q-learning curriculum (default, H100-tuned)
@@ -13,7 +14,7 @@ Usage:
     # Run with custom hyperparameters
     python train.py --num_steps 5000 --beta 0.5 --num_candidates 32
 
-    # Run with baselines for comparison (overlaid on same dashboard)
+    # Run with baselines for comparison (each gets its own dashboard + combined)
     python train.py --run_baselines --num_steps 1000
 
     # Run with wandb logging
@@ -51,12 +52,13 @@ def parse_args() -> AutodidactConfig:
 
     # Q-learning
     parser.add_argument("--beta", type=float, default=1.0, help="Boltzmann temperature")
-    parser.add_argument("--q_lr", type=float, default=1e-3, help="Q-network learning rate (eta)")
+    parser.add_argument("--q_lr", type=float, default=1e-4, help="Q-network learning rate (eta)")
+    parser.add_argument("--q_grad_clip", type=float, default=0.1, help="Q-network gradient clipping threshold")
     parser.add_argument("--tau", type=float, default=0.01, help="EMA rate for average reward (rho)")
 
     # LM training
     parser.add_argument("--lm_lr", type=float, default=5e-5, help="LM learning rate (alpha)")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping threshold (G)")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="LM gradient clipping threshold (G)")
 
     # Training
     parser.add_argument("--num_steps", type=int, default=10000, help="Number of training steps")
@@ -65,8 +67,7 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--dashboard_interval", type=int, default=50, help="Steps between dashboard refreshes")
 
     # Logging
-    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for JSONL log files")
-    parser.add_argument("--dashboard_path", type=str, default="dashboard.png", help="Path for live dashboard PNG")
+    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for JSONL log files and dashboards")
     parser.add_argument("--use_wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="autodidact", help="Wandb project name")
 
@@ -108,7 +109,7 @@ def main():
         print(f"  {key}: {val}")
     print("=" * 80)
 
-    # Collect all log file paths for multi-method dashboard overlay
+    # Collect all log file paths for combined dashboard
     all_log_files = []
 
     # --- Run Q-learning curriculum ---
@@ -122,6 +123,7 @@ def main():
         held_out_total_size=config.held_out_total_size,
         beta=config.beta,
         q_lr=config.q_lr,
+        q_grad_clip=config.q_grad_clip,
         tau=config.tau,
         lm_lr=config.lm_lr,
         grad_clip=config.grad_clip,
@@ -129,7 +131,6 @@ def main():
         eval_interval=config.eval_interval,
         dashboard_interval=config.dashboard_interval,
         log_dir=config.log_dir,
-        dashboard_path=config.dashboard_path,
         use_wandb=config.use_wandb,
         wandb_project=config.wandb_project,
         device=config.device,
@@ -157,7 +158,6 @@ def main():
                 eval_interval=config.eval_interval,
                 dashboard_interval=config.dashboard_interval,
                 log_dir=config.log_dir,
-                dashboard_path=config.dashboard_path,
                 use_wandb=config.use_wandb,
                 wandb_project=config.wandb_project,
                 device=config.device,
@@ -168,15 +168,15 @@ def main():
             )
             all_log_files.append(baseline_log)
 
-    # --- Final combined dashboard ---
-    if len(all_log_files) > 1:
-        print("\nRendering final combined dashboard...")
-        dashboard = DashboardPlotter(output_path=config.dashboard_path)
-        dashboard.render(all_log_files)
+        # --- Final combined dashboard overlaying all methods ---
+        print("\nRendering combined dashboard...")
+        combined_path = os.path.join(config.log_dir, "combined_dashboard.png")
+        combined_dashboard = DashboardPlotter(output_path=combined_path)
+        combined_dashboard.render(all_log_files)
+        print(f"  Combined dashboard: {combined_path}")
 
     print(f"\nAll runs complete.")
     print(f"  Log files: {all_log_files}")
-    print(f"  Dashboard: {config.dashboard_path}")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,11 @@ Key implementation insight (from Section 2.5):
     Each step's forward pass of candidates through the base model serves two 
     purposes: action selection for the *current* step and the bootstrap target 
     for the *previous* step's Q update. This avoids a redundant second forward pass.
+
+Reward semantics:
+    r_k = negative mean per-token cross-entropy on the held-out subset.
+    This is the average per-token log-probability, which is length-invariant
+    and directly interpretable (exp(-r_k) = perplexity).
 """
 
 import torch
@@ -13,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 from typing import Optional, Dict, Any, List
-from dataclasses import asdict
 import time
 import math
 
@@ -32,7 +36,7 @@ def compute_lm_loss(model: GPT2LMHeadModel, input_ids: torch.Tensor) -> torch.Te
         input_ids: [1, seq_len] or [seq_len] token IDs.
     
     Returns:
-        Scalar loss.
+        Scalar loss (per-token mean cross-entropy).
     """
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
@@ -46,12 +50,12 @@ def compute_held_out_reward(
     eval_batch_size: int = 16,
 ) -> float:
     """
-    Compute reward: average log-probability on held-out subset.
+    Compute reward: negative mean per-token cross-entropy on held-out subset.
     
-    r_k = (1/M) * log p_{theta_{k+1}}(D_hat_k)
-    
-    Since HuggingFace returns cross-entropy loss (negative log-prob per token),
-    we negate it to get log-probability. Processes in mini-batches for memory.
+    This is the average per-token log-probability, which:
+      - Is length-invariant (doesn't change with seq_len)
+      - Is directly interpretable: exp(-reward) = perplexity
+      - Stays in a narrow range (~-3 to -4 for GPT-2 on typical text)
     
     Args:
         model: GPT-2 model (already updated to theta_{k+1}).
@@ -59,7 +63,7 @@ def compute_held_out_reward(
         eval_batch_size: Mini-batch size for reward computation.
     
     Returns:
-        Scalar reward (average negative cross-entropy).
+        Scalar reward (negative per-token cross-entropy, higher is better).
     """
     total_loss = 0.0
     n_batches = 0
@@ -83,7 +87,7 @@ class AutodidactTrainer:
         - Boltzmann action selection
         - TD learning for the Q-network
         - JSONL metric logging (every step)
-        - Live dashboard PNG (periodic refresh)
+        - Per-run dashboard PNG (periodic refresh)
     """
 
     def __init__(
@@ -98,7 +102,8 @@ class AutodidactTrainer:
         held_out_total_size: int = 4096,
         # Q-learning
         beta: float = 1.0,
-        q_lr: float = 1e-3,
+        q_lr: float = 1e-4,
+        q_grad_clip: float = 0.1,
         tau: float = 0.01,
         # LM training
         lm_lr: float = 5e-5,
@@ -108,7 +113,6 @@ class AutodidactTrainer:
         eval_interval: int = 100,
         dashboard_interval: int = 50,
         log_dir: str = "logs",
-        dashboard_path: str = "dashboard.png",
         use_wandb: bool = False,
         wandb_project: str = "autodidact",
         # Device
@@ -135,6 +139,7 @@ class AutodidactTrainer:
         self.beta = beta
         self.tau = tau
         self.grad_clip = grad_clip
+        self.q_grad_clip = q_grad_clip
         self.num_candidates = num_candidates
         self.held_out_subset_size = held_out_subset_size
         self.seq_len = seq_len
@@ -151,7 +156,6 @@ class AutodidactTrainer:
 
         # --- Logging ---
         self.log_dir = log_dir
-        self.dashboard_path = dashboard_path
         self.use_wandb = use_wandb
         self.wandb_project = wandb_project
 
@@ -166,6 +170,7 @@ class AutodidactTrainer:
             "held_out_total_size": held_out_total_size,
             "beta": beta,
             "q_lr": q_lr,
+            "q_grad_clip": q_grad_clip,
             "tau": tau,
             "lm_lr": lm_lr,
             "grad_clip": grad_clip,
@@ -178,7 +183,7 @@ class AutodidactTrainer:
     def _lm_step(self, input_ids: torch.Tensor) -> tuple:
         """
         Perform one LM gradient step on the selected example, with gradient clipping.
-        Returns (loss_value, grad_norm).
+        Returns (loss_value, grad_norm_before_clip).
         """
         self.lm_optimizer.zero_grad()
         loss = compute_lm_loss(self.model, input_ids)
@@ -195,7 +200,7 @@ class AutodidactTrainer:
     ) -> tuple:
         """
         Perform one Q-network update step.
-        Returns (td_loss_value, q_grad_norm).
+        Returns (td_loss_value, q_grad_norm_before_clip).
         """
         self.q_optimizer.zero_grad()
 
@@ -208,7 +213,7 @@ class AutodidactTrainer:
         # TD loss
         td_loss = 0.5 * (q_hat - y) ** 2
         td_loss.backward()
-        q_grad_norm = torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.grad_clip).item()
+        q_grad_norm = torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.q_grad_clip).item()
         self.q_optimizer.step()
 
         return td_loss.item(), q_grad_norm
@@ -227,7 +232,8 @@ class AutodidactTrainer:
 
         # --- Set up logging ---
         logger = MetricsLogger("q_learning", log_dir=self.log_dir, config=self._config_dict)
-        dashboard = DashboardPlotter(output_path=self.dashboard_path)
+        # Per-run dashboard (lives next to the log file)
+        run_dashboard = DashboardPlotter(output_path=str(logger.dashboard_file))
 
         # --- Set up data ---
         print("Setting up streaming dataset...")
@@ -389,46 +395,52 @@ class AutodidactTrainer:
                     import wandb
                     wandb.log({"eval_reward": eval_reward, "eval_perplexity": eval_ppl, "step": k})
 
-            # --- Refresh dashboard ---
+            # --- Refresh per-run dashboard ---
             if k % self.dashboard_interval == 0:
                 try:
-                    dashboard.render([str(logger.log_file)])
+                    run_dashboard.render([str(logger.log_file)])
                 except Exception as e:
                     print(f"  [Dashboard render error: {e}]")
 
         # Final dashboard render
         try:
-            dashboard.render([str(logger.log_file)])
+            run_dashboard.render([str(logger.log_file)])
         except Exception as e:
             print(f"  [Final dashboard render error: {e}]")
 
         print(f"\nTraining complete. Log: {logger.log_file}")
+        print(f"                  Dashboard: {logger.dashboard_file}")
         return str(logger.log_file)
 
     def _full_eval(self, held_out: HeldOutSet) -> tuple:
-        """Evaluate on the full held-out set. Returns (reward, perplexity)."""
+        """
+        Evaluate on the full held-out set.
+        Returns (neg_per_token_ce, perplexity).
+        """
         self.model.eval()
+        batch_size = 16
+
         total_loss = 0.0
-        batch_size = 16  # Keep logits tensor manageable: [16, seq_len, 50257]
-        n = held_out.data.shape[0]
         n_batches = 0
         with torch.no_grad():
-            for i in range(0, n, batch_size):
+            for i in range(0, held_out.data.shape[0], batch_size):
                 batch = held_out.data[i : i + batch_size]
                 outputs = self.model(batch, labels=batch)
                 total_loss += outputs.loss.item()
                 n_batches += 1
         self.model.train()
-        avg_reward = -total_loss / n_batches
-        perplexity = math.exp(-avg_reward) if avg_reward > -100 else float("inf")
-        return avg_reward, perplexity
+
+        avg_ce = total_loss / n_batches
+        reward = -avg_ce
+        perplexity = math.exp(avg_ce) if avg_ce < 100 else float("inf")
+        return reward, perplexity
 
 
 class BaselineTrainer:
     """
     Trainer that uses baseline selection strategies instead of Q-learning.
     Shares the same LM training setup for fair comparison.
-    Logs to its own JSONL file and contributes to the shared dashboard.
+    Logs to its own JSONL file with its own per-run dashboard.
     """
 
     def __init__(
@@ -446,7 +458,6 @@ class BaselineTrainer:
         eval_interval: int = 100,
         dashboard_interval: int = 50,
         log_dir: str = "logs",
-        dashboard_path: str = "dashboard.png",
         use_wandb: bool = False,
         wandb_project: str = "autodidact",
         device: Optional[str] = None,
@@ -471,7 +482,6 @@ class BaselineTrainer:
         self.dataset_name = dataset_name
         self.held_out_total_size = held_out_total_size
         self.log_dir = log_dir
-        self.dashboard_path = dashboard_path
         self.use_wandb = use_wandb
         self.wandb_project = wandb_project
 
@@ -493,7 +503,7 @@ class BaselineTrainer:
         
         Args:
             num_steps: Number of training steps.
-            all_log_files: List of all log file paths (for multi-method dashboard overlay).
+            all_log_files: List of all log file paths (for multi-method combined dashboard).
         
         Returns:
             Path to this run's JSONL log file.
@@ -501,11 +511,12 @@ class BaselineTrainer:
         from .data import StreamingTextDataset
 
         logger = MetricsLogger(self.selector.name, log_dir=self.log_dir, config=self._config_dict)
-        dashboard = DashboardPlotter(output_path=self.dashboard_path)
+        # Per-run dashboard
+        run_dashboard = DashboardPlotter(output_path=str(logger.dashboard_file))
 
-        # Track all log files for overlay dashboard
-        log_files = list(all_log_files) if all_log_files else []
-        log_files.append(str(logger.log_file))
+        # Combined dashboard overlaying all methods so far
+        combined_log_files = list(all_log_files) if all_log_files else []
+        combined_log_files.append(str(logger.log_file))
 
         stream_dataset = StreamingTextDataset(
             tokenizer=self.tokenizer,
@@ -577,32 +588,36 @@ class BaselineTrainer:
 
             if k % self.dashboard_interval == 0:
                 try:
-                    dashboard.render(log_files)
+                    # Per-run dashboard (just this method)
+                    run_dashboard.render([str(logger.log_file)])
                 except Exception as e:
                     print(f"  [Dashboard render error: {e}]")
 
-        # Final render
+        # Final renders
         try:
-            dashboard.render(log_files)
+            run_dashboard.render([str(logger.log_file)])
         except Exception as e:
             print(f"  [Final dashboard render error: {e}]")
 
         print(f"\n[{self.selector.name}] Training complete. Log: {logger.log_file}")
+        print(f"                            Dashboard: {logger.dashboard_file}")
         return str(logger.log_file)
 
     def _full_eval(self, held_out: HeldOutSet) -> tuple:
         self.model.eval()
-        total_loss = 0.0
         batch_size = 16
-        n = held_out.data.shape[0]
+
+        total_loss = 0.0
         n_batches = 0
         with torch.no_grad():
-            for i in range(0, n, batch_size):
+            for i in range(0, held_out.data.shape[0], batch_size):
                 batch = held_out.data[i : i + batch_size]
                 outputs = self.model(batch, labels=batch)
                 total_loss += outputs.loss.item()
                 n_batches += 1
         self.model.train()
-        avg_reward = -total_loss / n_batches
-        perplexity = math.exp(-avg_reward) if avg_reward > -100 else float("inf")
-        return avg_reward, perplexity
+
+        avg_ce = total_loss / n_batches
+        reward = -avg_ce
+        perplexity = math.exp(avg_ce) if avg_ce < 100 else float("inf")
+        return reward, perplexity
