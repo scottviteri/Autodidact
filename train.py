@@ -46,9 +46,13 @@ def parse_args() -> AutodidactConfig:
     # Data
     parser.add_argument("--dataset_name", type=str, default="openwebtext", help="HuggingFace dataset name")
     parser.add_argument("--seq_len", type=int, default=1024, help="Context window length in tokens")
-    parser.add_argument("--num_candidates", type=int, default=64, help="N: candidates per step")
-    parser.add_argument("--held_out_subset_size", type=int, default=256, help="M: held-out subset size per step")
-    parser.add_argument("--held_out_total_size", type=int, default=4096, help="|D|: total held-out set size")
+    parser.add_argument("--num_candidates", type=int, default=256, help="N: candidates per step")
+    parser.add_argument("--held_out_subset_size", type=int, default=512, help="M: held-out subset size per step")
+    parser.add_argument("--held_out_total_size", type=int, default=8192, help="|D|: total held-out set size")
+
+    # Batching (GPU utilization)
+    parser.add_argument("--extract_batch_size", type=int, default=32, help="Mini-batch size for candidate hidden state extraction")
+    parser.add_argument("--eval_batch_size", type=int, default=64, help="Mini-batch size for held-out reward computation")
 
     # Q-learning
     parser.add_argument("--beta", type=float, default=1.0, help="Boltzmann temperature")
@@ -121,6 +125,8 @@ def main():
         num_candidates=config.num_candidates,
         held_out_subset_size=config.held_out_subset_size,
         held_out_total_size=config.held_out_total_size,
+        extract_batch_size=config.extract_batch_size,
+        eval_batch_size=config.eval_batch_size,
         beta=config.beta,
         q_lr=config.q_lr,
         q_grad_clip=config.q_grad_clip,
@@ -152,6 +158,7 @@ def main():
                 num_candidates=config.num_candidates,
                 held_out_subset_size=config.held_out_subset_size,
                 held_out_total_size=config.held_out_total_size,
+                eval_batch_size=config.eval_batch_size,
                 lm_lr=config.lm_lr,
                 grad_clip=config.grad_clip,
                 log_interval=config.log_interval,
