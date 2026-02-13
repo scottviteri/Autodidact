@@ -10,6 +10,8 @@ Architecture (from Section 2.3 of the spec):
     Dimensions: d -> 32 -> 1  (d = 768 for GPT-2)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -72,11 +74,24 @@ def extract_hidden_states(model, input_ids: torch.Tensor, batch_size: int = 16) 
 
 def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
     """
-    Compute the soft value function:
-        V(s) = beta * log sum_a' exp(Q(s, a') / beta)
+    Compute the normalized soft value function:
+        V(s) = beta * [ logsumexp(Q(s,a')/beta) - log(N) ]
     
-    This is the log-sum-exp over Q-values scaled by temperature, which appears
-    as the bootstrap term in the differential soft Bellman equation (Eq. 3).
+    The raw logsumexp includes a constant log(N) entropy bonus: even when all
+    Q-values are equal at q, logsumexp = q + log(N). This inflates the TD
+    target by ~log(N) every step, creating a persistent bootstrapping gap
+    that drives Q-values upward without bound.
+    
+    Subtracting log(N) normalizes against the uniform prior (p_0 = 1/N),
+    matching the free-energy interpretation in Section 2.6 of the spec where
+    the KL is taken against the uniform distribution. With this normalization:
+      - V(s) = 0 when all Q-values are equal (no preference over candidates)
+      - V(s) > 0 when some candidates are better than others
+      - The TD target y = r - rho + V stays centered near r - rho
+    
+    This does NOT affect the Boltzmann policy (softmax is shift-invariant),
+    and does NOT affect the relative ordering of Q-values. It only affects
+    the absolute scale of the bootstrap target.
     
     Args:
         q_values: [N, 1] Q-values for all candidates.
@@ -85,9 +100,9 @@ def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
     Returns:
         Scalar soft value V(s).
     """
-    # q_values is [N, 1], squeeze to [N]
-    q = q_values.squeeze(-1)
-    return beta * torch.logsumexp(q / beta, dim=0)
+    q = q_values.squeeze(-1)  # [N]
+    n = q.shape[0]
+    return beta * (torch.logsumexp(q / beta, dim=0) - math.log(n))
 
 
 def boltzmann_sample(q_values: torch.Tensor, beta: float) -> int:
