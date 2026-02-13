@@ -4,10 +4,18 @@ Hyperparameter configuration with dataclass defaults.
 Defaults are tuned for an H100 80GB GPU:
     - GPT-2 (124M params) uses ~0.5GB in fp32. Plenty of room.
     - seq_len=1024: full GPT-2 context window.
-    - N=64 candidates: larger candidate pools give the Q-network more to choose from.
-    - M=256 held-out subset: richer reward signal per step.
-    - |D|=4096 held-out total: ~4M tokens of held-out data.
+    - N=256 candidates: large pool gives the Q-network rich selection.
+    - M=512 held-out subset: richer reward signal per step.
+    - |D|=8192 held-out total: ~8M tokens of held-out data.
+    - extract_batch_size=32, eval_batch_size=64: large batches to utilize H100.
     - AdamW for LM, Adam for Q-network.
+
+GPU memory budget (H100 80GB):
+    Persistent: model (475 MB) + AdamW (949 MB) + held-out (64 MB) = ~1.5 GB
+    extract_hidden_states uses model.transformer directly (no LM head, no
+    intermediate hidden states), so peak per mini-batch is ~[B, seq_len, d]
+    instead of [B, seq_len, vocab_size] + 13x[B, seq_len, d].
+    Total peak ~3-4 GB, leaving >95% headroom.
 
 Q-network stability:
     - q_lr=1e-4 (not 1e-3): the Q-network is a tiny 2-layer MLP; higher LRs
@@ -31,9 +39,13 @@ class AutodidactConfig:
     # --- Data ---
     dataset_name: str = "openwebtext"
     seq_len: int = 1024              # Full GPT-2 context window
-    num_candidates: int = 64         # N: candidates per step
-    held_out_subset_size: int = 256  # M: held-out subset size per step
-    held_out_total_size: int = 4096  # |D|: total held-out set size
+    num_candidates: int = 256        # N: candidates per step
+    held_out_subset_size: int = 512  # M: held-out subset size per step
+    held_out_total_size: int = 8192  # |D|: total held-out set size
+
+    # --- Batching (GPU utilization) ---
+    extract_batch_size: int = 32     # Mini-batch size for candidate hidden state extraction
+    eval_batch_size: int = 64        # Mini-batch size for held-out reward computation
 
     # --- Q-learning ---
     beta: float = 1.0               # Boltzmann temperature

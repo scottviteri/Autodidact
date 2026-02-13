@@ -97,9 +97,12 @@ class AutodidactTrainer:
         # Data
         dataset_name: str = "openwebtext",
         seq_len: int = 1024,
-        num_candidates: int = 64,
-        held_out_subset_size: int = 256,
-        held_out_total_size: int = 4096,
+        num_candidates: int = 256,
+        held_out_subset_size: int = 512,
+        held_out_total_size: int = 8192,
+        # Batching (GPU utilization)
+        extract_batch_size: int = 32,
+        eval_batch_size: int = 64,
         # Q-learning
         beta: float = 1.0,
         q_lr: float = 1e-4,
@@ -142,6 +145,8 @@ class AutodidactTrainer:
         self.q_grad_clip = q_grad_clip
         self.num_candidates = num_candidates
         self.held_out_subset_size = held_out_subset_size
+        self.extract_batch_size = extract_batch_size
+        self.eval_batch_size = eval_batch_size
         self.seq_len = seq_len
         self.log_interval = log_interval
         self.eval_interval = eval_interval
@@ -168,6 +173,8 @@ class AutodidactTrainer:
             "num_candidates": num_candidates,
             "held_out_subset_size": held_out_subset_size,
             "held_out_total_size": held_out_total_size,
+            "extract_batch_size": extract_batch_size,
+            "eval_batch_size": eval_batch_size,
             "beta": beta,
             "q_lr": q_lr,
             "q_grad_clip": q_grad_clip,
@@ -260,7 +267,7 @@ class AutodidactTrainer:
         # =====================================================================
         print("Running bootstrap step...")
         C_0 = sampler.next_batch()                          # [N, seq_len]
-        H_0 = extract_hidden_states(self.model, C_0)       # [N, d]
+        H_0 = extract_hidden_states(self.model, C_0, batch_size=self.extract_batch_size)  # [N, d]
         q_0 = self.q_net(H_0)                              # [N, 1]
         a_0 = boltzmann_sample(q_0, self.beta)              # int
 
@@ -271,7 +278,7 @@ class AutodidactTrainer:
 
         # Compute reward after update
         D_hat = held_out.sample_subset(self.held_out_subset_size)
-        r_prev = compute_held_out_reward(self.model, D_hat)
+        r_prev = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
 
         # Initialize rho
         self.rho = r_prev
@@ -312,7 +319,7 @@ class AutodidactTrainer:
 
             # --- Forward candidates through base model (dual purpose) ---
             C_k = sampler.next_batch()                      # [N, seq_len]
-            H_k = extract_hidden_states(self.model, C_k)    # [N, d]
+            H_k = extract_hidden_states(self.model, C_k, batch_size=self.extract_batch_size)  # [N, d]
             q_k = self.q_net(H_k)                           # [N, 1]
 
             # --- Q update for previous transition ---
@@ -328,7 +335,7 @@ class AutodidactTrainer:
 
             # --- Compute reward ---
             D_hat = held_out.sample_subset(self.held_out_subset_size)
-            r_k = compute_held_out_reward(self.model, D_hat)
+            r_k = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
 
             # --- Update average reward ---
             self.rho = (1 - self.tau) * self.rho + self.tau * r_k
@@ -418,13 +425,12 @@ class AutodidactTrainer:
         Returns (neg_per_token_ce, perplexity).
         """
         self.model.eval()
-        batch_size = 16
 
         total_loss = 0.0
         n_batches = 0
         with torch.no_grad():
-            for i in range(0, held_out.data.shape[0], batch_size):
-                batch = held_out.data[i : i + batch_size]
+            for i in range(0, held_out.data.shape[0], self.eval_batch_size):
+                batch = held_out.data[i : i + self.eval_batch_size]
                 outputs = self.model(batch, labels=batch)
                 total_loss += outputs.loss.item()
                 n_batches += 1
@@ -449,9 +455,10 @@ class BaselineTrainer:
         model_name: str = "gpt2",
         dataset_name: str = "openwebtext",
         seq_len: int = 1024,
-        num_candidates: int = 64,
-        held_out_subset_size: int = 256,
-        held_out_total_size: int = 4096,
+        num_candidates: int = 256,
+        held_out_subset_size: int = 512,
+        held_out_total_size: int = 8192,
+        eval_batch_size: int = 64,
         lm_lr: float = 5e-5,
         grad_clip: float = 1.0,
         log_interval: int = 10,
@@ -475,6 +482,7 @@ class BaselineTrainer:
         self.grad_clip = grad_clip
         self.num_candidates = num_candidates
         self.held_out_subset_size = held_out_subset_size
+        self.eval_batch_size = eval_batch_size
         self.seq_len = seq_len
         self.log_interval = log_interval
         self.eval_interval = eval_interval
@@ -493,6 +501,7 @@ class BaselineTrainer:
             "num_candidates": num_candidates,
             "held_out_subset_size": held_out_subset_size,
             "held_out_total_size": held_out_total_size,
+            "eval_batch_size": eval_batch_size,
             "lm_lr": lm_lr,
             "grad_clip": grad_clip,
         }
@@ -550,7 +559,7 @@ class BaselineTrainer:
 
             # Reward
             D_hat = held_out.sample_subset(self.held_out_subset_size)
-            r_k = compute_held_out_reward(self.model, D_hat)
+            r_k = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
             cumulative_reward += r_k
 
             step_time = time.time() - step_start
@@ -605,13 +614,12 @@ class BaselineTrainer:
 
     def _full_eval(self, held_out: HeldOutSet) -> tuple:
         self.model.eval()
-        batch_size = 16
 
         total_loss = 0.0
         n_batches = 0
         with torch.no_grad():
-            for i in range(0, held_out.data.shape[0], batch_size):
-                batch = held_out.data[i : i + batch_size]
+            for i in range(0, held_out.data.shape[0], self.eval_batch_size):
+                batch = held_out.data[i : i + self.eval_batch_size]
                 outputs = self.model(batch, labels=batch)
                 total_loss += outputs.loss.item()
                 n_batches += 1
