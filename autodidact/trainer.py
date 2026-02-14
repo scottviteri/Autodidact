@@ -82,12 +82,12 @@ class AutodidactTrainer:
     
     Uses normalised discounted soft Q-learning:
         Q(s, a) = (1 - gamma) * r + gamma * V_target(s')
-        V(s) = beta * logsumexp(Q(s, a') / beta)
+        V(s) = beta * [logsumexp(Q(s, a') / beta) - log(N)]
         pi(a|s) = softmax(Q(s, a) / beta)
     
-    The (1 - gamma) factor on the reward keeps Q-values on the same scale
-    as the reward regardless of gamma. A target network with Polyak averaging
-    stabilises the bootstrap target V(s').
+    The (1 - gamma) on the reward and -log(N) in the soft value together
+    ensure Q* = r for a constant reward. A target network with Polyak
+    averaging stabilises the bootstrap target V(s').
     """
 
     def __init__(

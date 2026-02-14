@@ -13,7 +13,7 @@ Defaults are tuned for an H100 80GB GPU:
 Q-learning formulation:
     Uses normalised discounted soft Bellman equation:
         Q(s, a) = (1 - gamma) * r + gamma * V(s')
-        V(s) = beta * logsumexp(Q(s, a') / beta)
+        V(s) = beta * [logsumexp(Q(s, a') / beta) - log(N)]
     The (1 - gamma) factor on the reward keeps Q-values on the same scale as
     the reward regardless of gamma (a constant reward r gives Q* = r + const).
     A target network with Polyak averaging stabilises the bootstrap target.

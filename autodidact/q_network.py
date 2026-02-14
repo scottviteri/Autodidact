@@ -10,6 +10,8 @@ Architecture (from Section 2.3 of the spec):
     Dimensions: d -> 32 -> 1  (d = 768 for GPT-2)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -73,16 +75,16 @@ def extract_hidden_states(model, input_ids: torch.Tensor, batch_size: int = 32) 
 
 def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
     """
-    Compute the soft value function:
-        V(s) = beta * logsumexp(Q(s, a') / beta)
+    Compute the normalised soft value function:
+        V(s) = beta * [logsumexp(Q(s, a') / beta) - log(N)]
     
-    This is the entropy-regularised value from soft Q-learning (Haarnoja et al.,
-    2017). It appears as the bootstrap term in the normalised discounted soft
-    Bellman equation:
-        Q(s, a) = (1 - gamma) * r + gamma * V_target(s')
+    The log(N) subtraction removes the entropy bonus from the uniform prior.
+    Without it, even when all Q-values are equal at q, V = q + beta*log(N),
+    which inflates the Bellman fixed point by gamma*beta*log(N)/(1-gamma).
+    With it, uniform Q-values give V = q, and the fixed point is Q* = r
+    (matching the reward scale exactly).
     
-    The (1 - gamma) normalization keeps Q-values on the same scale as the reward.
-    A Polyak-averaged target network is used for V_target to stabilise training.
+    This does not affect the Boltzmann policy (softmax is shift-invariant).
     
     Args:
         q_values: [N, 1] Q-values for all candidates.
@@ -92,7 +94,8 @@ def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
         Scalar soft value V(s).
     """
     q = q_values.squeeze(-1)  # [N]
-    return beta * torch.logsumexp(q / beta, dim=0)
+    n = q.shape[0]
+    return beta * (torch.logsumexp(q / beta, dim=0) - math.log(n))
 
 
 def boltzmann_sample(q_values: torch.Tensor, beta: float) -> int:
