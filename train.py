@@ -53,9 +53,10 @@ def parse_args() -> AutodidactConfig:
 
     # Q-learning
     parser.add_argument("--beta", type=float, default=1.0, help="Boltzmann temperature")
-    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gamma", type=float, default=0.9, help="Discount factor")
     parser.add_argument("--q_lr", type=float, default=1e-4, help="Q-network learning rate")
     parser.add_argument("--q_grad_clip", type=float, default=1.0, help="Q-network gradient clip")
+    parser.add_argument("--tau", type=float, default=0.01, help="Polyak averaging rate for target Q-network")
 
     # LM training
     parser.add_argument("--lm_lr", type=float, default=5e-5, help="LM learning rate")
@@ -128,6 +129,7 @@ def main():
         gamma=config.gamma,
         q_lr=config.q_lr,
         q_grad_clip=config.q_grad_clip,
+        tau=config.tau,
         lm_lr=config.lm_lr,
         grad_clip=config.grad_clip,
         log_interval=config.log_interval,

@@ -80,13 +80,14 @@ class AutodidactTrainer:
     """
     Implements the full Autodidact training loop (Algorithm 1).
     
-    Uses discounted soft Q-learning:
-        Q(s, a) = r + gamma * V(s')
+    Uses normalised discounted soft Q-learning:
+        Q(s, a) = (1 - gamma) * r + gamma * V_target(s')
         V(s) = beta * logsumexp(Q(s, a') / beta)
         pi(a|s) = softmax(Q(s, a) / beta)
     
-    The discount factor gamma < 1 provides Bellman contraction, keeping
-    Q-values bounded without needing average-reward subtraction.
+    The (1 - gamma) factor on the reward keeps Q-values on the same scale
+    as the reward regardless of gamma. A target network with Polyak averaging
+    stabilises the bootstrap target V(s').
     """
 
     def __init__(
@@ -104,9 +105,10 @@ class AutodidactTrainer:
         eval_batch_size: int = 64,
         # Q-learning
         beta: float = 1.0,
-        gamma: float = 0.99,
+        gamma: float = 0.9,
         q_lr: float = 1e-4,
         q_grad_clip: float = 1.0,
+        tau: float = 0.01,
         # LM training
         lm_lr: float = 5e-5,
         grad_clip: float = 1.0,
@@ -137,6 +139,12 @@ class AutodidactTrainer:
         # --- Q-network ---
         self.q_net = QNetwork(hidden_dim=hidden_dim, inner_dim=32).to(self.device)
         self.q_optimizer = torch.optim.Adam(self.q_net.parameters(), lr=q_lr)
+
+        # --- Target Q-network (Polyak-averaged copy for stable bootstrap targets) ---
+        import copy
+        self.q_target = copy.deepcopy(self.q_net)
+        self.q_target.requires_grad_(False)  # No gradients through target network
+        self.tau = tau
 
         # --- LM optimizer (AdamW, standard for transformer fine-tuning) ---
         self.lm_optimizer = torch.optim.AdamW(self.model.parameters(), lr=lm_lr)
@@ -184,6 +192,7 @@ class AutodidactTrainer:
             "gamma": gamma,
             "q_lr": q_lr,
             "q_grad_clip": q_grad_clip,
+            "tau": tau,
             "lm_lr": lm_lr,
             "grad_clip": grad_clip,
             "soft_mixture": soft_mixture,
@@ -272,10 +281,14 @@ class AutodidactTrainer:
         soft_value_next: torch.Tensor,
     ) -> tuple:
         """
-        Perform one Q-network update step (discounted soft Bellman).
+        Perform one Q-network update step (normalised discounted soft Bellman).
         
-        TD target: y = r_prev + gamma * V(s_{k+1})
+        TD target: y = (1 - gamma) * r_prev + gamma * V_target(s_{k+1})
         Loss: 0.5 * (Q(h_prev) - y)^2
+        
+        The (1 - gamma) factor on the reward keeps Q-values on the same scale
+        as the reward regardless of gamma. V_target is computed from the target
+        network (Polyak-averaged copy) for stability.
         
         Returns (td_loss_value, q_grad_norm_before_clip).
         """
@@ -284,8 +297,8 @@ class AutodidactTrainer:
         # Re-evaluate previous action with current phi
         q_hat = self.q_net(h_prev.unsqueeze(0)).squeeze()  # scalar
 
-        # TD target (stop gradient)
-        y = r_prev + self.gamma * soft_value_next.detach()
+        # TD target (stop gradient; V computed from target network)
+        y = (1 - self.gamma) * r_prev + self.gamma * soft_value_next.detach()
 
         # TD loss
         td_loss = 0.5 * (q_hat - y) ** 2
@@ -293,7 +306,16 @@ class AutodidactTrainer:
         q_grad_norm = torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.q_grad_clip).item()
         self.q_optimizer.step()
 
+        # Polyak update: target <- tau * online + (1 - tau) * target
+        self._polyak_update()
+
         return td_loss.item(), q_grad_norm
+
+    @torch.no_grad()
+    def _polyak_update(self):
+        """Soft-update target Q-network toward online Q-network."""
+        for p, p_target in zip(self.q_net.parameters(), self.q_target.parameters()):
+            p_target.data.mul_(1 - self.tau).add_(self.tau * p.data)
 
     def _save_checkpoint(self, checkpoint_dir, step: int):
         """
@@ -306,6 +328,7 @@ class AutodidactTrainer:
             "step": step,
             "model_state_dict": self.model.state_dict(),
             "q_net_state_dict": self.q_net.state_dict(),
+            "q_target_state_dict": self.q_target.state_dict(),
             "lm_optimizer_state_dict": self.lm_optimizer.state_dict(),
             "q_optimizer_state_dict": self.q_optimizer.state_dict(),
         }, os.path.join(checkpoint_dir, "checkpoint.pt"))
@@ -408,8 +431,11 @@ class AutodidactTrainer:
             q_k = self.q_net(H_k)
 
             # --- Q update for previous transition ---
-            V_k = compute_soft_value(q_k, self.beta)
-            td_loss, q_grad_norm = self._q_step(h_prev, r_prev, V_k)
+            # Use target network for bootstrap V(s') to stabilise training
+            with torch.no_grad():
+                q_k_target = self.q_target(H_k)
+            V_k_target = compute_soft_value(q_k_target, self.beta)
+            td_loss, q_grad_norm = self._q_step(h_prev, r_prev, V_k_target)
 
             # --- Action selection for current step ---
             # (Still sample a discrete action for the Q-learning Bellman backup,
@@ -451,7 +477,7 @@ class AutodidactTrainer:
                 "q_std": q_k.std().item(),
                 "q_min": q_k.min().item(),
                 "q_max": q_k.max().item(),
-                "soft_value": V_k.item(),
+                "soft_value": compute_soft_value(q_k, self.beta).item(),
                 "cumulative_reward": cumulative_reward,
                 "lm_grad_norm": lm_grad_norm,
                 "q_grad_norm": q_grad_norm,

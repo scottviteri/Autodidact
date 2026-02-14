@@ -28,9 +28,11 @@ We propose an algorithm that enables language models to learn what data to learn
     \item Streaming data source, yielding fresh batches of $N$ candidate context windows each step
     \item Fixed held-out evaluation set $D$, large; a fresh random subset $\hat{D} \subset D$ of size $M$ is sampled each step for reward computation
     \item Q-network $Q_\phi$ with parameters $\phi$, implemented as a 2-layer MLP ($d \to 32 \to 1$) reading the base model's residual stream (see Section~\ref{sec:qnet})
+    \item Target Q-network $Q_{\bar{\phi}}$ with parameters $\bar{\phi}$, a Polyak-averaged copy of $Q_\phi$ used for stable bootstrap targets
     \item Boltzmann temperature $\beta > 0$ controlling exploration
     \item Learning rate $\alpha$ for the LM gradient step; learning rate $\eta$ for the Q-network update
     \item Discount factor $\gamma \in (0, 1)$ controlling the effective planning horizon
+    \item Polyak averaging rate $\tau \in (0, 1)$ for the target network update
     \item Gradient clipping threshold $G$ (max global norm; applied to both LM and Q-network gradient steps)
 \end{itemize}
 
@@ -61,30 +63,37 @@ The Q-network reads the base model's internal representations to assess candidat
 
 The hidden state $h_x$ implicitly encodes both the model's current state (through $\theta_k$, which determines the representations) and the identity of the candidate (through the input $x$). By detaching $h_x$, we ensure that $\theta$ is updated only by the language modeling objective, while $\phi$ is updated only by the TD loss. This prevents the co-adaptation instability that arises when value gradients distort the base model's representations.
 
-\subsection{Discounted Soft Bellman Equation}\label{sec:discount}
+\subsection{Normalised Discounted Soft Bellman Equation}\label{sec:discount}
 
-The Q-function satisfies the discounted soft Bellman equation:
+The Q-function satisfies a normalised discounted soft Bellman equation:
 \begin{equation}\label{eq:bellman}
-    Q(s_k, a_k) = r_k + \gamma\, \beta \log \sum_{a'} \exp\bigl(Q(s_{k+1}, a') / \beta\bigr),
+    Q(s_k, a_k) = (1 - \gamma)\, r_k + \gamma\, V_{\bar{\phi}}(s_{k+1}),
 \end{equation}
-where $\gamma \in (0, 1)$ is the discount factor. The discount serves two purposes: it ensures contraction of the Bellman operator (guaranteeing convergence of Q-learning with function approximation), and it defines an effective planning horizon of $\sim 1/(1-\gamma)$ steps over which the Q-function evaluates the consequences of a curriculum choice.
+where $\gamma \in (0, 1)$ is the discount factor and $V_{\bar{\phi}}$ is the soft value computed from the target network (see below). The $(1 - \gamma)$ factor on the reward is a normalisation that keeps Q-values on the same scale as the reward regardless of $\gamma$: a constant reward $r$ gives $Q^* = r + \gamma\, \beta \log N / (1 - \gamma)$ at the fixed point, where the first term is $O(r)$ rather than $O(r / (1 - \gamma))$. This prevents Q-value inflation and keeps the MLP output in a numerically comfortable range.
 
 The soft value function is:
 \begin{equation}
     V(s) = \beta \log \sum_{a'} \exp\bigl(Q(s, a') / \beta\bigr),
 \end{equation}
-so the Bellman equation reads $Q(s_k, a_k) = r_k + \gamma\, V(s_{k+1})$. At convergence, $Q(s, a)$ represents the discounted sum of future rewards from choosing $a$ in state $s$ and following the Boltzmann policy thereafter. With $\gamma = 0.99$, the effective horizon is $\sim\!100$ steps: the Q-function learns which training examples will lead to the best held-out performance over the next $\sim\!100$ gradient updates.
+so the Bellman equation reads $Q(s_k, a_k) = (1 - \gamma)\, r_k + \gamma\, V_{\bar{\phi}}(s_{k+1})$. At convergence, $Q(s, a)$ represents a normalised discounted sum of future rewards from choosing $a$ in state $s$ and following the Boltzmann policy thereafter. With $\gamma = 0.9$, the effective horizon is $\sim\!10$ steps.
 
-The discount factor bounds the Q-values: since $|r_k| \le R_{\max}$, we have $|Q| \le R_{\max}/(1 - \gamma)$. For per-token log-probabilities ($R_{\max} \approx 4$) and $\gamma = 0.99$, this gives $|Q| \le 400$, which is well within the representable range of the MLP.
+The normalisation bounds the reward contribution to Q-values: since $|r_k| \le R_{\max}$, the reward term contributes at most $(1 - \gamma) R_{\max} / (1 - \gamma) = R_{\max}$ to the Q-value fixed point. The entropy bonus from the soft value adds $\gamma\, \beta \log N / (1 - \gamma)$, which is a constant offset shared by all actions and does not affect the policy ranking.
+
+\paragraph{Target network.}
+To stabilise the bootstrap target $V(s_{k+1})$, we maintain a target network $Q_{\bar{\phi}}$ that is a Polyak-averaged copy of the online network $Q_\phi$:
+\begin{equation}
+    \bar{\phi} \;\leftarrow\; \tau\, \phi + (1 - \tau)\, \bar{\phi}, \qquad \tau \in (0, 1).
+\end{equation}
+The soft value in the TD target is computed from $Q_{\bar{\phi}}$, not $Q_\phi$. This breaks the feedback loop where the network's own output serves as its training target, preventing the oscillations and divergence that can occur with function approximation. The online network $Q_\phi$ is still used for action selection (the Boltzmann policy) and for the prediction $\hat{Q}$ in the TD loss. With $\tau = 0.01$, the target network tracks the online network with a lag of $\sim\!1/\tau = 100$ steps.
 
 \subsection{Algorithm}\label{sec:algorithm}
 
 The key implementation insight is that each step's forward pass of candidates through the base model serves two purposes: action selection for the \emph{current} step and the bootstrap target for the \emph{previous} step's Q update. This avoids a redundant second forward pass.
 
 \begin{algorithm}[h]
-\caption{Curriculum Selection via Discounted Soft Q-Learning}
+\caption{Curriculum Selection via Normalised Discounted Soft Q-Learning}
 \begin{algorithmic}[1]
-\State \textbf{Initialise:} LM parameters $\theta$; Q-network parameters $\phi$
+\State \textbf{Initialise:} LM parameters $\theta$; Q-network parameters $\phi$; target parameters $\bar{\phi} \gets \phi$
 \Statex
 \State \textcolor{gray}{\textit{// Bootstrap step (no Q update)}}
 \State $C_0 \gets \textsc{NextBatch}(\text{stream}, N)$
@@ -100,11 +109,13 @@ The key implementation insight is that each step's forward pass of candidates th
     \State $H_k \gets \textsc{DetachedHidden}(\theta, C_k)$ \Comment{Serves dual purpose below}
     \State $q_k \gets Q_\phi(H_k)$
     \Statex
-    \State \textcolor{gray}{\textit{// Q update for previous transition (uses current forward pass as bootstrap)}}
-    \State $V_{k} \gets \beta \log \sum_{a'} \exp\bigl(q_k[a'] / \beta\bigr)$ \Comment{Soft value of current state}
-    \State $y \gets r_{\text{prev}} + \gamma\, V_{k}$ \Comment{TD target, stop-gradient}
+    \State \textcolor{gray}{\textit{// Q update for previous transition (target network for bootstrap)}}
+    \State $\bar{q}_k \gets Q_{\bar{\phi}}(H_k)$ \Comment{Target network Q-values, no gradient}
+    \State $V_{k} \gets \beta \log \sum_{a'} \exp\bigl(\bar{q}_k[a'] / \beta\bigr)$ \Comment{Soft value from target network}
+    \State $y \gets (1 - \gamma)\, r_{\text{prev}} + \gamma\, V_{k}$ \Comment{Normalised TD target, stop-gradient}
     \State $\hat{q} \gets Q_\phi(h_{\text{prev}})$ \Comment{Re-evaluate previous action with current $\phi$}
     \State Update $\phi$ to minimise $\frac{1}{2}(\hat{q} - y)^2$, clipped to $\|\nabla\| \le G$
+    \State $\bar{\phi} \gets \tau\, \phi + (1 - \tau)\, \bar{\phi}$ \Comment{Polyak update}
     \Statex
     \State \textcolor{gray}{\textit{// Action selection for current step}}
     \State $a_k \gets \textsc{Sample}\bigl(\textsc{Softmax}(q_k / \beta)\bigr)$
@@ -118,9 +129,9 @@ The key implementation insight is that each step's forward pass of candidates th
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Computational cost per step.} One forward pass of $N$ candidates through the base model (batched, no gradient); one forward-backward pass of the selected example for LM training; one forward pass of $M$ held-out examples for reward; one MLP forward-backward for the Q update. The candidate forward pass dominates; the MLP and reward computations are comparatively cheap.
+\paragraph{Computational cost per step.} One forward pass of $N$ candidates through the base model (batched, no gradient); one forward-backward pass of the selected example for LM training; one forward pass of $M$ held-out examples for reward; one MLP forward-backward for the Q update; one MLP forward pass through the target network (negligible). The candidate forward pass dominates; the MLP and reward computations are comparatively cheap.
 
-\paragraph{Staleness.} The Q update at step $k$ uses $q_k$ (computed before the $\phi$ update) for both the bootstrap target and action selection. This one-step staleness is standard in online Q-learning and negligible in practice given the small MLP learning rate $\eta$.
+\paragraph{Staleness.} The Q update at step $k$ uses the target network $Q_{\bar{\phi}}$ for the bootstrap value $V_k$, and the online network $Q_\phi$ for action selection. The target network lags the online network by $\sim\!1/\tau$ steps, which is by design: this lag stabilises the TD target. The online Q-values $q_k$ used for action selection have one-step staleness (computed before the $\phi$ update), which is standard in online Q-learning and negligible given the small MLP learning rate $\eta$.
 
 \subsection{Soft Mixture Training Variant}\label{sec:softmixture}
 
@@ -231,7 +242,7 @@ The control-as-inference framework (Levine, 2018; Rawlik et al., 2013) casts opt
 
 \subsection{Soft Q-Learning}
 
-Soft Q-learning (Haarnoja et al., 2017) augments the standard Bellman equation with an entropy bonus, yielding a Boltzmann policy without requiring a separate policy network. SAC (Haarnoja et al., 2018) extends this to continuous actions with a learned temperature. Our setting is simpler: the action space is a finite set of $N$ candidates, so the Boltzmann policy and soft value can be computed exactly via softmax and logsumexp. The discount factor $\gamma$ provides the standard Bellman contraction guarantee, ensuring Q-values remain bounded under function approximation.
+Soft Q-learning (Haarnoja et al., 2017) augments the standard Bellman equation with an entropy bonus, yielding a Boltzmann policy without requiring a separate policy network. SAC (Haarnoja et al., 2018) extends this to continuous actions with a learned temperature. Our setting is simpler: the action space is a finite set of $N$ candidates, so the Boltzmann policy and soft value can be computed exactly via softmax and logsumexp. Following standard practice in deep Q-learning (Mnih et al., 2015; Lillicrap et al., 2016), we use a Polyak-averaged target network for the bootstrap value and normalise the reward by $(1 - \gamma)$ to keep Q-values on the same scale as the reward.
 
 \subsection{Intrinsic Motivation}
 

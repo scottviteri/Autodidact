@@ -11,11 +11,13 @@ Defaults are tuned for an H100 80GB GPU:
     - AdamW for LM, Adam for Q-network.
 
 Q-learning formulation:
-    Uses standard discounted soft Bellman equation:
-        Q(s, a) = r + gamma * V(s')
+    Uses normalised discounted soft Bellman equation:
+        Q(s, a) = (1 - gamma) * r + gamma * V(s')
         V(s) = beta * logsumexp(Q(s, a') / beta)
-    The discount factor gamma < 1 provides Bellman contraction, keeping
-    Q-values bounded. gamma=0.99 gives an effective horizon of ~100 steps.
+    The (1 - gamma) factor on the reward keeps Q-values on the same scale as
+    the reward regardless of gamma (a constant reward r gives Q* = r + const).
+    A target network with Polyak averaging stabilises the bootstrap target.
+    gamma=0.9 gives an effective horizon of ~10 steps.
 """
 
 from dataclasses import dataclass
@@ -42,9 +44,10 @@ class AutodidactConfig:
 
     # --- Q-learning ---
     beta: float = 1.0               # Boltzmann temperature
-    gamma: float = 0.99             # Discount factor
+    gamma: float = 0.9              # Discount factor (horizon ~1/(1-gamma) = 10 steps)
     q_lr: float = 1e-4              # eta: Q-network learning rate
     q_grad_clip: float = 1.0        # Q-network gradient clipping
+    tau: float = 0.01               # Polyak averaging rate for target Q-network
 
     # --- LM training ---
     lm_lr: float = 5e-5             # alpha: LM learning rate
