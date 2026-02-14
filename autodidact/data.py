@@ -36,7 +36,7 @@ class StreamingTextDataset(IterableDataset):
         self.split = split
 
     def __iter__(self) -> Iterator[torch.Tensor]:
-        dataset = load_dataset(self.dataset_name, split=self.split, streaming=True, trust_remote_code=True)
+        dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
         buffer = []
         for example in dataset:
             text = example["text"]
@@ -87,12 +87,12 @@ class HeldOutSet:
 
         # Build the held-out set by consuming from the dataset.
         # We use a different slice of the data by skipping ahead.
-        dataset = load_dataset(dataset_name, split=split, streaming=True, trust_remote_code=True)
+        dataset = load_dataset(dataset_name, split=split, streaming=True)
         buffer = []
         examples = []
         # Skip some data to avoid overlap with training stream.
         # We'll consume and discard some initial examples, then collect.
-        skip_count = 50000  # Skip first 50k documents for held-out
+        skip_count = 5000  # Skip first 5k documents for held-out
         count = 0
         for example in dataset:
             count += 1
