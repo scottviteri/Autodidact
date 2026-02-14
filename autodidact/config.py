@@ -75,3 +75,7 @@ class AutodidactConfig:
     # --- Baselines ---
     run_baselines: bool = False
     baseline_methods: str = "random,loss_based,uncertainty"  # comma-separated
+
+    # --- Needle experiment ---
+    needle: bool = False              # Run needle-in-a-haystack Q-value validation
+    needle_text: Optional[str] = None # Custom text for the needle sequence

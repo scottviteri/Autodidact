@@ -29,6 +29,7 @@ from autodidact.config import AutodidactConfig
 from autodidact.trainer import AutodidactTrainer, BaselineTrainer
 from autodidact.baselines import RandomSelector, LossBasedSelector, UncertaintyBasedSelector
 from autodidact.logging import DashboardPlotter
+from autodidact.needle_experiment import NeedleExperiment
 
 
 def parse_args() -> AutodidactConfig:
@@ -87,6 +88,12 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--run_baselines", action="store_true")
     parser.add_argument("--baseline_methods", type=str, default="random,loss_based,uncertainty")
 
+    # Needle-in-a-haystack experiment
+    parser.add_argument("--needle", action="store_true",
+                        help="Run the needle-in-a-haystack Q-value validation experiment")
+    parser.add_argument("--needle_text", type=str, default=None,
+                        help="Custom text for the needle (default: repeating proverbs)")
+
     args = parser.parse_args()
     return AutodidactConfig(**vars(args))
 
@@ -111,6 +118,33 @@ def main():
     for key, val in vars(config).items():
         print(f"  {key}: {val}")
     print("=" * 80)
+
+    # --- Needle-in-a-haystack experiment (standalone) ---
+    if config.needle:
+        print("\n--- Needle-in-a-Haystack Q-Value Validation ---\n")
+        experiment = NeedleExperiment(
+            model_name=config.model_name,
+            seq_len=config.seq_len,
+            num_candidates=config.num_candidates,
+            held_out_size=config.held_out_subset_size,
+            extract_batch_size=config.extract_batch_size,
+            eval_batch_size=config.eval_batch_size,
+            beta=config.beta,
+            gamma=config.gamma,
+            q_lr=config.q_lr,
+            q_grad_clip=config.q_grad_clip,
+            tau=config.tau,
+            lm_lr=config.lm_lr,
+            grad_clip=config.grad_clip,
+            num_steps=config.num_steps,
+            log_interval=config.log_interval,
+            dashboard_interval=config.dashboard_interval,
+            log_dir=config.log_dir,
+            device=config.device,
+            needle_text=config.needle_text,
+        )
+        experiment.run()
+        return
 
     all_log_files = []
 
