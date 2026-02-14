@@ -55,6 +55,7 @@ class AutodidactConfig:
     log_interval: int = 10          # Log every N steps (to JSONL + stdout)
     eval_interval: int = 100        # Full held-out eval every N steps
     dashboard_interval: int = 50    # Refresh per-run dashboard PNG every N steps
+    save_interval: int = 500        # Save checkpoint every N steps (overwritten each time)
 
     # --- Logging ---
     log_dir: str = "logs"           # JSONL logs and per-run dashboards go here

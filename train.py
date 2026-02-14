@@ -66,6 +66,7 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--dashboard_interval", type=int, default=50)
+    parser.add_argument("--save_interval", type=int, default=500, help="Save checkpoint every N steps")
 
     # Logging
     parser.add_argument("--log_dir", type=str, default="logs")
@@ -132,6 +133,7 @@ def main():
         log_interval=config.log_interval,
         eval_interval=config.eval_interval,
         dashboard_interval=config.dashboard_interval,
+        save_interval=config.save_interval,
         log_dir=config.log_dir,
         use_wandb=config.use_wandb,
         wandb_project=config.wandb_project,
@@ -162,6 +164,7 @@ def main():
                 log_interval=config.log_interval,
                 eval_interval=config.eval_interval,
                 dashboard_interval=config.dashboard_interval,
+                save_interval=config.save_interval,
                 log_dir=config.log_dir,
                 use_wandb=config.use_wandb,
                 wandb_project=config.wandb_project,

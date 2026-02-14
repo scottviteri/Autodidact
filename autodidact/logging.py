@@ -41,6 +41,8 @@ class MetricsLogger:
         self.log_file = self.log_dir / f"{timestamp}_{method_name}.jsonl"
         # Per-run dashboard: same stem, .png extension
         self.dashboard_file = self.log_dir / f"{timestamp}_{method_name}.png"
+        # Per-run checkpoint directory: same stem
+        self.checkpoint_dir = self.log_dir / f"{timestamp}_{method_name}_ckpt"
 
         # Write config as the first line (metadata header)
         header = {

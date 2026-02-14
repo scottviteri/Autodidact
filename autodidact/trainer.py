@@ -114,6 +114,7 @@ class AutodidactTrainer:
         log_interval: int = 10,
         eval_interval: int = 100,
         dashboard_interval: int = 50,
+        save_interval: int = 500,
         log_dir: str = "logs",
         use_wandb: bool = False,
         wandb_project: str = "autodidact",
@@ -153,6 +154,7 @@ class AutodidactTrainer:
         self.log_interval = log_interval
         self.eval_interval = eval_interval
         self.dashboard_interval = dashboard_interval
+        self.save_interval = save_interval
 
         # --- Data ---
         self.dataset_name = dataset_name
@@ -292,6 +294,22 @@ class AutodidactTrainer:
         self.q_optimizer.step()
 
         return td_loss.item(), q_grad_norm
+
+    def _save_checkpoint(self, checkpoint_dir, step: int):
+        """
+        Save model and Q-network weights to checkpoint_dir, overwriting any
+        previous checkpoint from this run. Only one checkpoint is kept per run.
+        """
+        import os
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save({
+            "step": step,
+            "model_state_dict": self.model.state_dict(),
+            "q_net_state_dict": self.q_net.state_dict(),
+            "lm_optimizer_state_dict": self.lm_optimizer.state_dict(),
+            "q_optimizer_state_dict": self.q_optimizer.state_dict(),
+        }, os.path.join(checkpoint_dir, "checkpoint.pt"))
+        print(f"  [Checkpoint saved: step {step} -> {checkpoint_dir}]")
 
     def train(self, num_steps: int = 10000) -> str:
         """
@@ -479,7 +497,12 @@ class AutodidactTrainer:
                 except Exception as e:
                     print(f"  [Dashboard render error: {e}]")
 
-        # Final dashboard render
+            # --- Save checkpoint (overwrite previous) ---
+            if k % self.save_interval == 0:
+                self._save_checkpoint(str(logger.checkpoint_dir), k)
+
+        # Final saves
+        self._save_checkpoint(str(logger.checkpoint_dir), num_steps)
         try:
             run_dashboard.render([str(logger.log_file)])
         except Exception as e:
@@ -487,6 +510,7 @@ class AutodidactTrainer:
 
         print(f"\nTraining complete. Log: {logger.log_file}")
         print(f"                  Dashboard: {logger.dashboard_file}")
+        print(f"                  Checkpoint: {logger.checkpoint_dir}")
         return str(logger.log_file)
 
     def _full_eval(self, held_out: HeldOutSet) -> tuple:
@@ -526,6 +550,7 @@ class BaselineTrainer:
         log_interval: int = 10,
         eval_interval: int = 100,
         dashboard_interval: int = 50,
+        save_interval: int = 500,
         log_dir: str = "logs",
         use_wandb: bool = False,
         wandb_project: str = "autodidact",
@@ -549,6 +574,7 @@ class BaselineTrainer:
         self.log_interval = log_interval
         self.eval_interval = eval_interval
         self.dashboard_interval = dashboard_interval
+        self.save_interval = save_interval
         self.dataset_name = dataset_name
         self.held_out_total_size = held_out_total_size
         self.log_dir = log_dir
@@ -628,6 +654,11 @@ class BaselineTrainer:
                 except Exception as e:
                     print(f"  [Dashboard render error: {e}]")
 
+            if k % self.save_interval == 0:
+                self._save_checkpoint(str(logger.checkpoint_dir), k)
+
+        # Final saves
+        self._save_checkpoint(str(logger.checkpoint_dir), num_steps)
         try:
             run_dashboard.render([str(logger.log_file)])
         except Exception as e:
@@ -635,7 +666,19 @@ class BaselineTrainer:
 
         print(f"\n[{self.selector.name}] Training complete. Log: {logger.log_file}")
         print(f"                            Dashboard: {logger.dashboard_file}")
+        print(f"                            Checkpoint: {logger.checkpoint_dir}")
         return str(logger.log_file)
+
+    def _save_checkpoint(self, checkpoint_dir, step: int):
+        """Save model weights to checkpoint_dir, overwriting previous."""
+        import os
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save({
+            "step": step,
+            "model_state_dict": self.model.state_dict(),
+            "lm_optimizer_state_dict": self.lm_optimizer.state_dict(),
+        }, os.path.join(checkpoint_dir, "checkpoint.pt"))
+        print(f"  [{self.selector.name} Checkpoint saved: step {step} -> {checkpoint_dir}]")
 
     def _full_eval(self, held_out: HeldOutSet) -> tuple:
         self.model.eval()
