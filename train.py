@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Entry point for Autodidact: Curriculum Selection via Discounted Soft Q-Learning.
+Entry point for Autodidact: Curriculum Selection via Normalised Discounted Soft Q-Learning.
 
 Each run produces:
     - A timestamped JSONL log file in logs/ with every metric at every step.
@@ -33,7 +33,7 @@ from autodidact.logging import DashboardPlotter
 
 def parse_args() -> AutodidactConfig:
     parser = argparse.ArgumentParser(
-        description="Autodidact: Curriculum Selection via Discounted Soft Q-Learning",
+        description="Autodidact: Curriculum Selection via Normalised Discounted Soft Q-Learning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -106,7 +106,7 @@ def main():
     config = parse_args()
 
     print("=" * 80)
-    print("Autodidact: Curriculum Selection via Discounted Soft Q-Learning")
+    print("Autodidact: Curriculum Selection via Normalised Discounted Soft Q-Learning")
     print("=" * 80)
     for key, val in vars(config).items():
         print(f"  {key}: {val}")

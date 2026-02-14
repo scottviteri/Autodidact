@@ -1,6 +1,6 @@
 """
 Main training loop implementing Algorithm 1 from the spec:
-    Curriculum Selection via Discounted Soft Q-Learning.
+    Curriculum Selection via Normalised Discounted Soft Q-Learning.
 
 Key implementation insight (from Section 2.5):
     Each step's forward pass of candidates through the base model serves two 

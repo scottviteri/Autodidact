@@ -46,7 +46,9 @@ The reward is the held-out log-probability \emph{after} the training update:
 \begin{equation}\label{eq:reward}
     r_k = \frac{1}{M}\log p_{\theta_{k+1}}(\hat{D}_k),
 \end{equation}
-where $\hat{D}_k$ is a fresh random subset of $D$ of size $M$, and $\theta_{k+1}$ results from training on $a_k$. This measures the model's absolute predictive fitness as a consequence of the selected action. Resampling $\hat{D}_k$ each step prevents the Q-function from overfitting to a fixed evaluation subset. The cumulative objective $\sum_k r_k$ is the integral of the learning curve: it penalises every step spent with poor predictions, rewarding curricula that reach high performance quickly. Equivalently, maximising $\sum_k r_k$ minimises cumulative regret $\sum_k (L^* - r_k)$ where $L^*$ is the best achievable log-probability.
+where $\hat{D}_k$ is a fresh random subset of $D$ of size $M$, and $\theta_{k+1}$ results from training on $a_k$. This measures the model's absolute predictive fitness as a consequence of the selected action. Resampling $\hat{D}_k$ each step prevents the Q-function from overfitting to a fixed evaluation subset.
+
+The Q-function optimises the discounted return $(1 - \gamma) \sum_k \gamma^k r_k$. The weights $(1 - \gamma)\gamma^k$ sum to one, so this is the \emph{exponentially weighted average} of the reward sequence: the Q-value at any state equals the typical per-step reward expected over the next $\sim\!1/(1-\gamma)$ steps under the current policy. Maximising this objective favours curricula that achieve high predictive fitness quickly---each step spent with poor predictions is penalised, with a horizon controlled by $\gamma$.
 
 \subsection{Q-Network Architecture}\label{sec:qnet}
 
@@ -160,7 +162,7 @@ In the base algorithm, the LM gradient is a single-sample Monte Carlo estimate o
 The Q-network update proceeds exactly as in Section~\ref{sec:algorithm}: a discrete action $a_k$ is still sampled from the Boltzmann policy, its hidden state $h_{\text{prev}}$ is stored, and the standard TD update is applied at the next step. The Q-function continues to satisfy the discounted soft Bellman equation~\eqref{eq:bellman}. The only change is in how the environment \emph{transitions}: the LM parameters are updated via the full mixture rather than a single example.
 
 \paragraph{Off-policy interpretation.}
-From the Q-learner's perspective, the situation is analogous to off-policy learning. The Q-learner observes: ``I selected action $a_k$, the environment transitioned to state $s_{k+1}$, and I received reward $r_k$.'' It does not need to know that the transition was caused by a mixture-weighted gradient step rather than a single-example step. Q-learning is inherently off-policy---the Bellman backup $Q(s, a) = r + \gamma V(s')$ is valid regardless of the behavior policy that generated the transition, as long as $r$ and $s'$ are the actual observed reward and next state.
+From the Q-learner's perspective, the situation is analogous to off-policy learning. The Q-learner observes: ``I selected action $a_k$, the environment transitioned to state $s_{k+1}$, and I received reward $r_k$.'' It does not need to know that the transition was caused by a mixture-weighted gradient step rather than a single-example step. Q-learning is inherently off-policy---the Bellman backup $Q(s, a) = (1-\gamma)\,r + \gamma\, V(s')$ is valid regardless of the behavior policy that generated the transition, as long as $r$ and $s'$ are the actual observed reward and next state.
 
 In this case, the ``behavior policy'' (the mixture-weighted LM update) is a smooth, deterministic function of the same Boltzmann policy that the Q-learner is evaluating. Over many steps, the Q-function converges to predict the value of upweighting a given candidate within the mixture---which is exactly the marginal contribution signal needed to set the mixture weights well.
 

@@ -76,13 +76,13 @@ def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
     Compute the soft value function:
         V(s) = beta * logsumexp(Q(s, a') / beta)
     
-    This is the standard entropy-regularised value from soft Q-learning
-    (Haarnoja et al., 2017). It appears as the bootstrap term in the
-    discounted soft Bellman equation:
-        Q(s, a) = r + gamma * V(s')
+    This is the entropy-regularised value from soft Q-learning (Haarnoja et al.,
+    2017). It appears as the bootstrap term in the normalised discounted soft
+    Bellman equation:
+        Q(s, a) = (1 - gamma) * r + gamma * V_target(s')
     
-    The discount factor gamma provides Bellman contraction, keeping Q-values
-    bounded without needing centering or average-reward subtraction.
+    The (1 - gamma) normalization keeps Q-values on the same scale as the reward.
+    A Polyak-averaged target network is used for V_target to stabilise training.
     
     Args:
         q_values: [N, 1] Q-values for all candidates.
