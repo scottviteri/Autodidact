@@ -145,7 +145,7 @@ class LangevinQSampler:
         return torch.cat(q_list, dim=0)  # [K]
 
     @torch.no_grad()
-    def _snap_to_tokens(self, embeds: torch.Tensor) -> torch.Tensor:
+    def _snap_to_tokens(self, embeds: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Map continuous embeddings to discrete tokens via nearest-neighbor
         cosine similarity against the wte embedding matrix.
@@ -158,6 +158,7 @@ class LangevinQSampler:
 
         Returns:
             token_ids: [B, seq_len]  (dtype=long)
+            max_cosine_sims: [B, seq_len]  max cosine similarity per position
         """
         B, S, d = embeds.shape
         flat = embeds.reshape(B * S, d)                          # [B*S, d]
@@ -166,12 +167,16 @@ class LangevinQSampler:
         # Process in chunks of 256 positions to keep memory bounded
         chunk_size = 256
         ids_list = []
+        max_sims_list = []
         for start in range(0, flat_norm.shape[0], chunk_size):
             chunk = flat_norm[start : start + chunk_size]         # [chunk, d]
             sims = chunk @ self._wte_norm.T                       # [chunk, V]
-            ids_list.append(sims.argmax(dim=-1))                  # [chunk]
+            max_sims, max_ids = sims.max(dim=-1)                  # [chunk], [chunk]
+            ids_list.append(max_ids)
+            max_sims_list.append(max_sims)
         ids = torch.cat(ids_list, dim=0)                          # [B*S]
-        return ids.reshape(B, S)
+        max_sims = torch.cat(max_sims_list, dim=0)                # [B*S]
+        return ids.reshape(B, S), max_sims.reshape(B, S)
 
     def sample(self) -> Tuple[torch.Tensor, dict]:
         """
@@ -192,11 +197,13 @@ class LangevinQSampler:
                 Unbiased baseline:
                   q_random_mean/std: Q-values of fresh random embeddings
                     (evaluated at the end, same cost as one energy call)
+                Snap quality:
+                  snap_cosine_mean: avg cosine similarity between each
+                    continuous SGLD embedding and its nearest-neighbor token
+                    in the wte matrix (higher = closer to token manifold)
                 Diversity / mixing:
                   embed_pairwise_cosine_mean: avg cosine sim between all
                     pairs of collected embedding vectors (lower = more diverse)
-                  token_unique_ratio: fraction of unique token sequences
-                    among collected samples (1.0 = all different)
                   token_jaccard_mean: avg pairwise Jaccard similarity of
                     token sets across samples (lower = more diverse)
                 Gradient health:
@@ -297,7 +304,8 @@ class LangevinQSampler:
         del collected, embeds
 
         # --- Snap to discrete tokens ---
-        query_ids = self._snap_to_tokens(all_embeds)
+        query_ids, snap_cosine_sims = self._snap_to_tokens(all_embeds)
+        snap_cosine_mean = snap_cosine_sims.mean().item()
 
         # --- Final Q-values of collected samples ---
         with torch.no_grad():
@@ -328,10 +336,8 @@ class LangevinQSampler:
         else:
             embed_pairwise_cosine_mean = 0.0
 
-        # --- Diversity: unique token sequences and Jaccard similarity ---
+        # --- Diversity: pairwise Jaccard similarity of token sets ---
         token_sets = [set(query_ids[i].cpu().tolist()) for i in range(query_ids.shape[0])]
-        unique_seqs = set(tuple(query_ids[i].cpu().tolist()) for i in range(query_ids.shape[0]))
-        token_unique_ratio = len(unique_seqs) / max(query_ids.shape[0], 1)
 
         if len(token_sets) > 1:
             jaccard_sum = 0.0
@@ -373,7 +379,7 @@ class LangevinQSampler:
             "q_random_std": q_random_std,
             # Diversity
             "embed_pairwise_cosine_mean": embed_pairwise_cosine_mean,
-            "token_unique_ratio": token_unique_ratio,
+            "snap_cosine_mean": snap_cosine_mean,
             "token_jaccard_mean": token_jaccard_mean,
             # Gradient health
             "grad_norm_mean": grad_norm_mean,

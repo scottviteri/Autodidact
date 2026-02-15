@@ -861,6 +861,16 @@ class LangevinRAGTrainer:
             device=self.device,
         )
 
+        # Dimensionality info for reference baselines on plots
+        self._rag_embed_dim = self.rag_index.embed_dim
+        self._wte_hidden_dim = hidden_dim
+        self._wte_vocab_size = self.model.config.vocab_size
+
+        # Expected max cosine similarity for random unit vectors:
+        #   E[max cos(q, v_i)] ~ sqrt(2 * ln(N) / d)  for N database vectors in R^d
+        self._random_max_cos_rag = math.sqrt(2 * math.log(rag_index_size) / self._rag_embed_dim)
+        self._random_max_cos_snap = math.sqrt(2 * math.log(self._wte_vocab_size) / self._wte_hidden_dim)
+
         # Store config
         self._config_dict = {
             "method_name": "langevin_rag",
@@ -889,6 +899,12 @@ class LangevinRAGTrainer:
             "rag_embedding_model": rag_embedding_model,
             "rag_index_size": rag_index_size,
             "rag_top_k": rag_top_k,
+            # Dimensionality info for dashboard reference lines
+            "rag_embed_dim": self._rag_embed_dim,
+            "wte_hidden_dim": self._wte_hidden_dim,
+            "wte_vocab_size": self._wte_vocab_size,
+            "random_max_cos_rag": self._random_max_cos_rag,
+            "random_max_cos_snap": self._random_max_cos_snap,
         }
 
         if use_wandb:
@@ -1092,9 +1108,9 @@ class LangevinRAGTrainer:
             # Unbiased baseline
             "q_random_mean": langevin_info["q_random_mean"],
             "q_random_std": langevin_info["q_random_std"],
-            # SGLD diversity
+            # SGLD snap quality + diversity
+            "sgld_snap_cosine_mean": langevin_info["snap_cosine_mean"],
             "sgld_embed_cosine_mean": langevin_info["embed_pairwise_cosine_mean"],
-            "sgld_token_unique_ratio": langevin_info["token_unique_ratio"],
             "sgld_token_jaccard_mean": langevin_info["token_jaccard_mean"],
             # SGLD gradient health
             "sgld_grad_norm_mean": langevin_info["grad_norm_mean"],
@@ -1196,9 +1212,9 @@ class LangevinRAGTrainer:
                 # Unbiased Q baseline (random embeddings)
                 "q_random_mean": langevin_info["q_random_mean"],
                 "q_random_std": langevin_info["q_random_std"],
-                # SGLD diversity
+                # SGLD snap quality + diversity
+                "sgld_snap_cosine_mean": langevin_info["snap_cosine_mean"],
                 "sgld_embed_cosine_mean": langevin_info["embed_pairwise_cosine_mean"],
-                "sgld_token_unique_ratio": langevin_info["token_unique_ratio"],
                 "sgld_token_jaccard_mean": langevin_info["token_jaccard_mean"],
                 # SGLD gradient health
                 "sgld_grad_norm_mean": langevin_info["grad_norm_mean"],
@@ -1224,7 +1240,7 @@ class LangevinRAGTrainer:
                     f"sgld_Q={langevin_info['q_final_mean']:.3f} "
                     f"(rand={langevin_info['q_random_mean']:.3f} "
                     f"gain={langevin_info['q_gain']:+.3f}) | "
-                    f"div={langevin_info['token_unique_ratio']:.0%} | "
+                    f"snap_cos={langevin_info['snap_cosine_mean']:.3f} | "
                     f"retr={rag_info['num_retrieved_unique']} | "
                     f"{step_time:.2f}s "
                     f"[sgld={sgld_pct:.0f}% lm={lm_pct:.0f}%]"

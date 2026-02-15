@@ -234,7 +234,7 @@ class LangevinRAGDashboard:
       Row 2 — Q-learning:
         TD Loss              | SGLD Q vs Random Q    | SGLD Q Gain          | Soft Value
       Row 3 — SGLD health:
-        SGLD Grad Norm       | Grad Clip Fraction    | Embed Cosine Sim     | Token Unique Ratio
+        SGLD Grad Norm       | Grad Clip Fraction    | Embed Cosine Sim     | Snap Cosine Sim
       Row 4 — RAG + diversity:
         RAG Top-1 Score      | Num Retrieved         | Token Jaccard Sim    | SGLD Q Best
       Row 5 — Timing + resources:
@@ -253,10 +253,13 @@ class LangevinRAGDashboard:
         fig.suptitle("Langevin-RAG Training Dashboard", fontsize=16, fontweight="bold", y=0.98)
 
         all_runs = []
+        first_config = {}
         for path in log_paths:
             if not os.path.exists(path):
                 continue
             config, metrics, evals = _read_log(path)
+            if not first_config:
+                first_config = config
             method = config.get("method_name", os.path.basename(path).rsplit(".", 1)[0])
             with open(path, "r") as f:
                 first = json.loads(f.readline())
@@ -361,10 +364,9 @@ class LangevinRAGDashboard:
             ax = axes[2][2]
             _plot_line(ax, metrics, "sgld_embed_cosine_mean", c, method)
 
-            # (2,3) Token Unique Ratio (1.0 = all samples different)
+            # (2,3) SGLD Snap Cosine Similarity (embedding -> nearest token)
             ax = axes[2][3]
-            _plot_line(ax, metrics, "sgld_token_unique_ratio", c, method)
-            ax.set_ylim(-0.05, 1.05)
+            _plot_line(ax, metrics, "sgld_snap_cosine_mean", c, method)
 
             # ===== Row 4: RAG + diversity =====
 
@@ -431,7 +433,7 @@ class LangevinRAGDashboard:
             # Row 2
             "TD Loss", "SGLD Q vs Random Q", "SGLD Q Gain (final-init)", "Soft Value (V_k)",
             # Row 3
-            "SGLD Grad Norm", "Grad Clip Fraction", "Embed Cosine Sim (lower=diverse)", "Token Unique Ratio",
+            "SGLD Grad Norm", "Grad Clip Fraction", "Embed Cosine Sim (lower=diverse)", "SGLD Snap Cosine Sim",
             # Row 4
             "RAG Top-1 Score", "Num Retrieved", "Token Jaccard (lower=diverse)", "SGLD Best Q",
             # Row 5
@@ -447,6 +449,31 @@ class LangevinRAGDashboard:
                 ax.set_xlabel("Step", fontsize=7)
             if ax.get_legend_handles_labels()[1]:
                 ax.legend(fontsize=7, loc="best")
+
+        # --- Reference lines: expected max cosine sim for random vectors ---
+        # E[max cos(q, v_i)] ~ sqrt(2 * ln(N) / d) for N unit vectors in R^d
+        random_max_cos_rag = first_config.get("random_max_cos_rag")
+        random_max_cos_snap = first_config.get("random_max_cos_snap")
+        rag_embed_dim = first_config.get("rag_embed_dim")
+        rag_index_size = first_config.get("rag_index_size")
+        wte_hidden_dim = first_config.get("wte_hidden_dim")
+        wte_vocab_size = first_config.get("wte_vocab_size")
+
+        if random_max_cos_rag is not None:
+            ax = axes[3][0]  # RAG Top-1 Score
+            ax.axhline(
+                y=random_max_cos_rag, color="gray", linestyle="--", alpha=0.7, linewidth=1.2,
+                label=f"Random baseline (d={rag_embed_dim}, N={rag_index_size}): {random_max_cos_rag:.3f}",
+            )
+            ax.legend(fontsize=6, loc="best")
+
+        if random_max_cos_snap is not None:
+            ax = axes[2][3]  # SGLD Snap Cosine Sim
+            ax.axhline(
+                y=random_max_cos_snap, color="gray", linestyle="--", alpha=0.7, linewidth=1.2,
+                label=f"Random baseline (d={wte_hidden_dim}, N={wte_vocab_size}): {random_max_cos_snap:.3f}",
+            )
+            ax.legend(fontsize=6, loc="best")
 
         fig.tight_layout(rect=[0, 0, 1, 0.96])
 

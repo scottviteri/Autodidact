@@ -99,8 +99,8 @@ class AutodidactConfig:
     langevin_temperature: float = 1.0 # Sampling temperature (scales energy)
     langevin_noise_scale: float = 1.0 # Multiplier on Gaussian noise term
     langevin_grad_clip: float = 1.0   # Clip embedding gradients per chain
-    langevin_batch_size: int = 32     # Chains to process in parallel in _energy()
-    lm_micro_batch_size: int = 32     # Micro-batch size for gradient-accumulated LM training
+    langevin_batch_size: int = 256     # Chains to process in parallel in _energy()
+    lm_micro_batch_size: int = 256     # Micro-batch size for gradient-accumulated LM training
     rag_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     rag_index_size: int = 50000       # Number of dataset windows to index
     rag_top_k: int = 8                # Retrieved examples per query
