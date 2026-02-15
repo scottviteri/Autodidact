@@ -8,14 +8,17 @@ Each run produces:
     - When --run_baselines is used, a combined dashboard overlaying all methods.
 
 Usage:
-    # Run Q-learning curriculum (default, H100-tuned)
+    # Run Langevin-RAG curriculum (default, H100-tuned)
     python train.py
 
     # Run with custom hyperparameters
-    python train.py --num_steps 5000 --beta 0.5 --gamma 0.95
+    python train.py --num_steps 5000 --langevin_steps 200
+
+    # Run the discrete-Q mode instead
+    python train.py --no_langevin_rag
 
     # Run with baselines for comparison
-    python train.py --run_baselines --num_steps 1000
+    python train.py --no_langevin_rag --run_baselines --num_steps 1000
 
     # Use a specific device
     python train.py --device cuda:0
@@ -43,10 +46,10 @@ def parse_args() -> AutodidactConfig:
 
     # Data
     parser.add_argument("--dataset_name", type=str, default="openwebtext")
-    parser.add_argument("--seq_len", type=int, default=1024)
-    parser.add_argument("--num_candidates", type=int, default=256, help="N: candidates per step")
-    parser.add_argument("--held_out_subset_size", type=int, default=512, help="M: held-out subset size")
-    parser.add_argument("--held_out_total_size", type=int, default=8192, help="|D|: total held-out set")
+    parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--num_candidates", type=int, default=256, help="N: candidates per step (discrete-Q mode)")
+    parser.add_argument("--held_out_subset_size", type=int, default=256, help="M: held-out subset size")
+    parser.add_argument("--held_out_total_size", type=int, default=2048, help="|D|: total held-out set")
 
     # Batching
     parser.add_argument("--extract_batch_size", type=int, default=32)
@@ -94,10 +97,12 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--needle_text", type=str, default=None,
                         help="Custom text for the needle (default: repeating proverbs)")
 
-    # Langevin-RAG mode
-    parser.add_argument("--langevin_rag", action="store_true",
-                        help="Use Langevin Q-guided search + RAG retrieval for curriculum selection")
-    parser.add_argument("--langevin_seq_len", type=int, default=128,
+    # Langevin-RAG mode (default)
+    parser.add_argument("--langevin_rag", action="store_true", default=True,
+                        help="Use Langevin Q-guided search + RAG retrieval (default)")
+    parser.add_argument("--no_langevin_rag", dest="langevin_rag", action="store_false",
+                        help="Disable Langevin-RAG; use discrete-Q candidate selection instead")
+    parser.add_argument("--langevin_seq_len", type=int, default=64,
                         help="Sequence length for Langevin embedding optimization")
     parser.add_argument("--langevin_num_chains", type=int, default=8,
                         help="K: parallel Langevin chains")
@@ -117,9 +122,9 @@ def parse_args() -> AutodidactConfig:
                         help="Multiplier on Gaussian noise in Langevin updates")
     parser.add_argument("--langevin_grad_clip", type=float, default=1.0,
                         help="Clip embedding gradients per chain")
-    parser.add_argument("--langevin_batch_size", type=int, default=4,
+    parser.add_argument("--langevin_batch_size", type=int, default=32,
                         help="Chains to process in parallel during Langevin energy computation")
-    parser.add_argument("--lm_micro_batch_size", type=int, default=4,
+    parser.add_argument("--lm_micro_batch_size", type=int, default=32,
                         help="Micro-batch size for gradient-accumulated LM training on retrieved examples")
     parser.add_argument("--rag_embedding_model", type=str,
                         default="sentence-transformers/all-MiniLM-L6-v2",
@@ -183,9 +188,9 @@ def main():
 
     all_log_files = []
 
-    # --- Langevin-RAG mode (standalone) ---
+    # --- Langevin-RAG mode (default) ---
     if config.langevin_rag:
-        print("\n--- Langevin Q-Guided Search + RAG Retrieval ---\n")
+        print("\n--- Langevin Q-Guided Search + RAG Retrieval (default) ---\n")
         trainer = LangevinRAGTrainer(
             model_name=config.model_name,
             dataset_name=config.dataset_name,
@@ -231,8 +236,8 @@ def main():
         print(f"  Log files: {all_log_files}")
         return
 
-    # --- Run Q-learning curriculum ---
-    print("\n--- Q-Learning Curriculum ---\n")
+    # --- Discrete-Q mode (--no_langevin_rag) ---
+    print("\n--- Discrete-Q Curriculum (--no_langevin_rag) ---\n")
     trainer = AutodidactTrainer(
         model_name=config.model_name,
         dataset_name=config.dataset_name,

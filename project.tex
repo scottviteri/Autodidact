@@ -176,6 +176,116 @@ The LM loss becomes the unweighted average over all candidates:
 \end{equation}
 This decouples the LM training step from the Q-function entirely: the LM trains on an equal mixture of all candidates regardless of their Q-values. The Q-network still trains normally (receiving rewards, computing TD updates), but its output does not influence which data the LM learns from. This serves as a controlled ablation to isolate the effect of Q-weighted curriculum selection on sample efficiency.
 
+\section{Langevin-RAG Curriculum Selection}\label{sec:langevinrag}
+
+The discrete-Q approach (Section~\ref{sec:algorithm}) scores a fixed batch of $N$ candidates per step. This limits the search to the $N$ examples that happen to appear in the current batch---a tiny fraction of the training corpus. To search over a much larger space of possible training data, we introduce a two-stage pipeline that uses the Q-network as an energy function for continuous optimisation via Stochastic Gradient Langevin Dynamics (SGLD), then retrieves real training examples from a large indexed corpus via Retrieval-Augmented Generation (RAG).
+
+\subsection{Overview}
+
+The pipeline proceeds in four stages per training step:
+\begin{enumerate}[nosep]
+    \item \textbf{Langevin sampling in embedding space} (Section~\ref{sec:sgld}): Initialise $K$ parallel chains of continuous embeddings and run SGLD using the Q-network as an energy function. After burn-in, collect samples that represent ``what the Q-network wants to train on.''
+    \item \textbf{Snap to tokens} (Section~\ref{sec:snap}): Map each continuous embedding sample to a discrete token sequence via nearest-neighbor lookup against the model's token embedding matrix.
+    \item \textbf{RAG retrieval} (Section~\ref{sec:rag}): Embed the discrete query sentences with a sentence-transformer model and retrieve the top-$k$ most similar real training examples from a pre-built FAISS index of the corpus.
+    \item \textbf{Unweighted LM training}: Train the language model on the retrieved examples with uniform loss (no Q-weighting), since the curriculum signal is already embedded in which examples were retrieved.
+\end{enumerate}
+
+The key insight is that the Q-network encodes a preference over text via the base model's representations: $Q_\phi(\text{transformer}(x))$ assigns a scalar value to any input. By treating $Q$ as an energy function and sampling in the continuous embedding space, we can search over an effectively infinite space of ``virtual'' inputs, unconstrained by which examples happen to be in the current batch.
+
+\subsection{SGLD in Embedding Space}\label{sec:sgld}
+
+Let $\mathbf{e} \in \mathbb{R}^{L \times d}$ be a continuous embedding sequence of length $L$ in the GPT-2 embedding space ($d = 768$). Define the energy function:
+\begin{equation}\label{eq:energy}
+    E(\mathbf{e}) = \frac{1}{\tau}\, Q_\phi\bigl(\text{transformer}(\mathbf{e})\bigr),
+\end{equation}
+where $\text{transformer}(\mathbf{e})$ feeds $\mathbf{e}$ as \texttt{inputs\_embeds} (bypassing the token embedding lookup), extracts the last-layer hidden state at the final position, and passes it through the Q-network $Q_\phi$. The temperature $\tau > 0$ controls how peaked the resulting distribution is around high-$Q$ regions.
+
+We seek samples from $p(\mathbf{e}) \propto \exp(E(\mathbf{e}))$---the Boltzmann distribution that concentrates on embeddings with high Q-values. SGLD produces approximate samples via the Langevin update:
+\begin{equation}\label{eq:langevin}
+    \mathbf{e}_{t+1} = \mathbf{e}_t + \frac{\varepsilon}{2}\, \nabla_{\mathbf{e}} E(\mathbf{e}_t) + \sqrt{\varepsilon}\;\boldsymbol{\eta}_t, \qquad \boldsymbol{\eta}_t \sim \mathcal{N}(0, \sigma^2 I),
+\end{equation}
+where $\varepsilon$ is the step size and $\sigma$ controls the noise scale. The gradient $\nabla_{\mathbf{e}} E$ is computed by backpropagating from the Q-value through the full transformer into the input embeddings. Gradient checkpointing is used to keep memory bounded during this backward pass.
+
+\paragraph{Initialisation.} Each of the $K$ chains is initialised by sampling random token IDs uniformly from the vocabulary and looking up their embeddings via the model's $\mathtt{wte}$ matrix. This places the initial points in a realistic region of embedding space.
+
+\paragraph{Gradient clipping.} Per-chain gradient norms are clipped to a threshold $G_{\text{embed}}$ to prevent instability from large gradients in early Langevin steps.
+
+\paragraph{Collection.} The first $B$ steps are discarded as burn-in. After burn-in, every $T$-th sample is collected (thinning) to reduce autocorrelation. Collection stops once the desired number of samples $S$ has been gathered. With $K$ parallel chains, this requires $\lceil S / K \rceil$ collection events.
+
+\subsection{Snap to Tokens}\label{sec:snap}
+
+Each collected embedding sample $\mathbf{e} \in \mathbb{R}^{L \times d}$ is a continuous vector that does not correspond to any real token sequence. We map it to discrete tokens via nearest-neighbor cosine similarity against the model's token embedding matrix $W_e \in \mathbb{R}^{V \times d}$:
+\begin{equation}\label{eq:snap}
+    t_i = \arg\max_{v \in \{1, \ldots, V\}} \frac{\mathbf{e}_i \cdot W_e[v]}{\|\mathbf{e}_i\| \, \|W_e[v]\|}, \qquad i = 1, \ldots, L.
+\end{equation}
+This produces a discrete token sequence $\mathbf{t} = (t_1, \ldots, t_L)$ that is typically incoherent natural language---a bag of loosely related tokens---since the Langevin dynamics optimises for Q-value rather than fluency. However, this sequence serves only as a \emph{query} for RAG retrieval, not as training data itself; the sentence-transformer embedding (Section~\ref{sec:rag}) is robust to such noise.
+
+\subsection{RAG Retrieval}\label{sec:rag}
+
+\paragraph{Index construction (once, at startup).} We stream through the training corpus and extract $I$ fixed-length token windows. Each window is decoded to text and embedded with a pretrained sentence-transformer model (all-MiniLM-L6-v2, $d_{\text{st}} = 384$), producing normalised embedding vectors. These are stored in a FAISS inner-product index for efficient nearest-neighbor search.
+
+\paragraph{Query and retrieval (each step).} The $S$ discrete query sequences from the snap step are decoded to text and embedded with the same sentence-transformer. For each query, the top-$k$ nearest neighbours in the FAISS index are retrieved by cosine similarity. Results are deduplicated across all queries to produce $R \leq S \cdot k$ unique training examples.
+
+\paragraph{Why RAG works despite gibberish queries.} The sentence-transformer maps the incoherent token sequence to a dense vector that captures its topical content---the model is trained to be robust to paraphrasing and noise. Empirically, the cosine similarity between query embeddings and retrieved documents is $\sim\!0.44$ (moderate similarity), indicating that the retrieval is coarse enough to tolerate the snap artifacts while still being meaningfully directed by the Q-network's preferences.
+
+\subsection{Langevin-RAG Algorithm}\label{sec:langevin_algorithm}
+
+\begin{algorithm}[h]
+\caption{Curriculum Selection via Langevin-RAG}
+\begin{algorithmic}[1]
+\State \textbf{Initialise:} LM parameters $\theta$; Q-network $\phi$; target $\bar{\phi} \gets \phi$; FAISS index over $I$ corpus windows
+\Statex
+\For{$k = 0, 1, 2, \ldots$}
+    \Statex
+    \State \textcolor{gray}{\textit{// Stage 1: SGLD in embedding space}}
+    \State Initialise $K$ chains: $\mathbf{e}^{(j)}_0 \gets \texttt{wte}(\text{random tokens}),\; j = 1, \ldots, K$
+    \For{$t = 0, 1, \ldots, T_{\max}$}
+        \State $\mathbf{e}^{(j)}_{t+1} \gets \mathbf{e}^{(j)}_t + \frac{\varepsilon}{2}\, \text{clip}\bigl(\nabla_{\mathbf{e}} E(\mathbf{e}^{(j)}_t),\, G_{\text{embed}}\bigr) + \sqrt{\varepsilon}\;\boldsymbol{\eta}_t$ \Comment{Eq.~\eqref{eq:langevin}}
+        \If{$t \geq B$ and $(t - B) \bmod T = 0$}
+            \State Collect $\mathbf{e}^{(1)}_t, \ldots, \mathbf{e}^{(K)}_t$
+        \EndIf
+    \EndFor
+    \Statex
+    \State \textcolor{gray}{\textit{// Stage 2: Snap to discrete tokens}}
+    \State For each collected sample $\mathbf{e}$, compute $\mathbf{t} = \text{snap}(\mathbf{e})$ via Eq.~\eqref{eq:snap}
+    \Statex
+    \State \textcolor{gray}{\textit{// Stage 3: RAG retrieval}}
+    \State Embed query texts $\{\text{decode}(\mathbf{t})\}$ with sentence-transformer
+    \State Retrieve $R$ unique training examples from FAISS index
+    \Statex
+    \State \textcolor{gray}{\textit{// Stage 4: Q update (for previous transition, if $k > 0$)}}
+    \State $H_k \gets \textsc{DetachedHidden}(\theta, \text{retrieved examples})$ \Comment{$[R, d]$}
+    \State Compute $V_k$ from $Q_{\bar{\phi}}(H_k)$ as in Eq.~\eqref{eq:bellman}
+    \State Update $\phi$ to minimise $\frac{1}{2}(\hat{q}_{\text{prev}} - [(1-\gamma)\,r_{\text{prev}} + \gamma\,V_k])^2$
+    \State $\bar{\phi} \gets \tau\,\phi + (1-\tau)\,\bar{\phi}$
+    \Statex
+    \State \textcolor{gray}{\textit{// Stage 5: LM training (unweighted)}}
+    \State $\theta \gets \theta - \alpha\,\nabla_\theta \frac{1}{R}\sum_{i=1}^{R} \ell(\theta, x_i)$ \Comment{Uniform loss over retrieved examples}
+    \Statex
+    \State \textcolor{gray}{\textit{// Stage 6: Reward}}
+    \State $r_k \gets \frac{1}{M}\log p_\theta(\hat{D}_k)$ \Comment{Held-out evaluation}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{LM training is unweighted.} Unlike the discrete-Q approach (Section~\ref{sec:algorithm}), the LM trains on the retrieved examples with \emph{uniform} loss. The curriculum signal is not in the \emph{weights} on examples but in \emph{which} examples are retrieved. The Q-network's preferences are expressed through the SGLD $\to$ snap $\to$ RAG pipeline, which acts as a soft argmax: the Langevin dynamics finds high-Q regions of embedding space, these are projected to queries, and the queries pull relevant real data from the corpus.
+
+\paragraph{Q-learning is off-policy.} The Q-network update is identical to the discrete-Q version: observe reward $r_k$, compute the TD target from the target network, and minimise the squared TD error. The Q-learner does not need to know how the training data was selected---it only observes the resulting reward. This makes the Langevin-RAG pipeline compatible with the same normalised discounted soft Bellman equation (Eq.~\eqref{eq:bellman}).
+
+\paragraph{Computational cost.} SGLD dominates the per-step cost ($\sim\!56\%$ of wall time), as it requires backpropagating through the full transformer at each Langevin step. RAG retrieval is negligible ($<\!1\%$). LM training accounts for $\sim\!13\%$, and held-out reward evaluation for $\sim\!26\%$. On an H100, each step takes $\sim\!3.7$s with the default parameters ($K=8$ chains, $T_{\max}=100$ steps, $L=64$ tokens, batch size 16).
+
+\subsection{SGLD Diagnostics}\label{sec:sgld_diagnostics}
+
+Monitoring SGLD health is critical for tuning the Langevin hyperparameters. We track:
+
+\begin{itemize}[nosep]
+    \item \textbf{Q gain} ($\Delta Q$): The difference between Q-values of collected samples and Q-values at initialisation. Positive $\Delta Q$ indicates that SGLD is climbing the Q landscape. Empirically, $\Delta Q$ grows from $\sim\!0.2$ early in training to $\sim\!0.8$ as the Q-network develops more structured gradients.
+    \item \textbf{Random-Q baseline}: Q-values of fresh random embeddings, evaluated each step. This provides an \emph{unbiased} reference---the Q-values of collected samples are biased high by construction. The gap between SGLD Q and random Q measures the informativeness of the Langevin search.
+    \item \textbf{Diversity}: Pairwise cosine similarity of collected embedding vectors (lower $=$ more diverse), fraction of unique token sequences, and pairwise Jaccard similarity of token sets. With well-tuned parameters, all samples should be distinct (unique ratio $= 1.0$) and nearly orthogonal (cosine $\sim\!0.01$).
+    \item \textbf{Gradient health}: Mean gradient norm and fraction of steps where gradient clipping activates. High clip fractions ($>\!50\%$) suggest the step size $\varepsilon$ or clip threshold $G_{\text{embed}}$ may need adjustment.
+    \item \textbf{Per-phase timing}: Wall-clock seconds for SGLD, RAG, LM training, and reward evaluation, shown as both absolute values and percentages.
+\end{itemize}
+
 \subsection{Interpretation as Free-Energy Minimisation}\label{sec:freeenergy}
 
 The Boltzmann policy is the solution to a free-energy minimisation problem at each state:
