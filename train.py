@@ -26,7 +26,7 @@ import os
 import sys
 
 from autodidact.config import AutodidactConfig
-from autodidact.trainer import AutodidactTrainer, BaselineTrainer
+from autodidact.trainer import AutodidactTrainer, BaselineTrainer, LangevinRAGTrainer
 from autodidact.baselines import RandomSelector, LossBasedSelector, UncertaintyBasedSelector
 from autodidact.logging import DashboardPlotter
 from autodidact.needle_experiment import NeedleExperiment
@@ -94,6 +94,41 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--needle_text", type=str, default=None,
                         help="Custom text for the needle (default: repeating proverbs)")
 
+    # Langevin-RAG mode
+    parser.add_argument("--langevin_rag", action="store_true",
+                        help="Use Langevin Q-guided search + RAG retrieval for curriculum selection")
+    parser.add_argument("--langevin_seq_len", type=int, default=128,
+                        help="Sequence length for Langevin embedding optimization")
+    parser.add_argument("--langevin_num_chains", type=int, default=8,
+                        help="K: parallel Langevin chains")
+    parser.add_argument("--langevin_num_samples", type=int, default=8,
+                        help="Total samples to collect from Langevin dynamics")
+    parser.add_argument("--langevin_steps", type=int, default=100,
+                        help="Total Langevin steps (burn-in + collection)")
+    parser.add_argument("--langevin_burn_in", type=int, default=50,
+                        help="Discard first N Langevin steps")
+    parser.add_argument("--langevin_thin", type=int, default=5,
+                        help="Keep every N-th sample after burn-in")
+    parser.add_argument("--langevin_step_size", type=float, default=0.01,
+                        help="Langevin step size epsilon")
+    parser.add_argument("--langevin_temperature", type=float, default=1.0,
+                        help="Langevin sampling temperature (scales the energy)")
+    parser.add_argument("--langevin_noise_scale", type=float, default=1.0,
+                        help="Multiplier on Gaussian noise in Langevin updates")
+    parser.add_argument("--langevin_grad_clip", type=float, default=1.0,
+                        help="Clip embedding gradients per chain")
+    parser.add_argument("--langevin_batch_size", type=int, default=4,
+                        help="Chains to process in parallel during Langevin energy computation")
+    parser.add_argument("--lm_micro_batch_size", type=int, default=4,
+                        help="Micro-batch size for gradient-accumulated LM training on retrieved examples")
+    parser.add_argument("--rag_embedding_model", type=str,
+                        default="sentence-transformers/all-MiniLM-L6-v2",
+                        help="Sentence-transformer model for RAG embeddings")
+    parser.add_argument("--rag_index_size", type=int, default=50000,
+                        help="Number of dataset windows to index for RAG")
+    parser.add_argument("--rag_top_k", type=int, default=8,
+                        help="Number of examples to retrieve per query")
+
     args = parser.parse_args()
     return AutodidactConfig(**vars(args))
 
@@ -147,6 +182,54 @@ def main():
         return
 
     all_log_files = []
+
+    # --- Langevin-RAG mode (standalone) ---
+    if config.langevin_rag:
+        print("\n--- Langevin Q-Guided Search + RAG Retrieval ---\n")
+        trainer = LangevinRAGTrainer(
+            model_name=config.model_name,
+            dataset_name=config.dataset_name,
+            seq_len=config.seq_len,
+            held_out_subset_size=config.held_out_subset_size,
+            held_out_total_size=config.held_out_total_size,
+            extract_batch_size=config.extract_batch_size,
+            eval_batch_size=config.eval_batch_size,
+            beta=config.beta,
+            gamma=config.gamma,
+            q_lr=config.q_lr,
+            q_grad_clip=config.q_grad_clip,
+            tau=config.tau,
+            lm_lr=config.lm_lr,
+            grad_clip=config.grad_clip,
+            langevin_seq_len=config.langevin_seq_len,
+            langevin_num_chains=config.langevin_num_chains,
+            langevin_num_samples=config.langevin_num_samples,
+            langevin_steps=config.langevin_steps,
+            langevin_burn_in=config.langevin_burn_in,
+            langevin_thin=config.langevin_thin,
+            langevin_step_size=config.langevin_step_size,
+            langevin_temperature=config.langevin_temperature,
+            langevin_noise_scale=config.langevin_noise_scale,
+            langevin_grad_clip=config.langevin_grad_clip,
+            langevin_batch_size=config.langevin_batch_size,
+            lm_micro_batch_size=config.lm_micro_batch_size,
+            rag_embedding_model=config.rag_embedding_model,
+            rag_index_size=config.rag_index_size,
+            rag_top_k=config.rag_top_k,
+            log_interval=config.log_interval,
+            eval_interval=config.eval_interval,
+            dashboard_interval=config.dashboard_interval,
+            save_interval=config.save_interval,
+            log_dir=config.log_dir,
+            use_wandb=config.use_wandb,
+            wandb_project=config.wandb_project,
+            device=config.device,
+        )
+        log_file = trainer.train(num_steps=config.num_steps)
+        all_log_files.append(log_file)
+        print(f"\nLangevin-RAG run complete.")
+        print(f"  Log files: {all_log_files}")
+        return
 
     # --- Run Q-learning curriculum ---
     print("\n--- Q-Learning Curriculum ---\n")

@@ -222,3 +222,235 @@ class DashboardPlotter:
         fig.savefig(tmp_path, dpi=120, bbox_inches="tight")
         os.replace(tmp_path, self.output_path)
         plt.close(fig)
+
+
+class LangevinRAGDashboard:
+    """
+    Renders a 5x4 (20-panel) dashboard tailored for the Langevin-RAG pipeline.
+
+    Panels (row-major):
+      Row 1 — Training quality:
+        Reward               | Cumulative Reward     | LM Loss              | Eval Perplexity
+      Row 2 — Q-learning:
+        TD Loss              | SGLD Q vs Random Q    | SGLD Q Gain          | Soft Value
+      Row 3 — SGLD health:
+        SGLD Grad Norm       | Grad Clip Fraction    | Embed Cosine Sim     | Token Unique Ratio
+      Row 4 — RAG + diversity:
+        RAG Top-1 Score      | Num Retrieved         | Token Jaccard Sim    | SGLD Q Best
+      Row 5 — Timing + resources:
+        Time Breakdown        | Time per Step         | GPU Peak Memory      | LM / Q Grad Norms
+    """
+
+    def __init__(self, output_path: str = "dashboard.png"):
+        self.output_path = output_path
+
+    def render(self, log_paths: List[str]):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(5, 4, figsize=(24, 22))
+        fig.suptitle("Langevin-RAG Training Dashboard", fontsize=16, fontweight="bold", y=0.98)
+
+        all_runs = []
+        for path in log_paths:
+            if not os.path.exists(path):
+                continue
+            config, metrics, evals = _read_log(path)
+            method = config.get("method_name", os.path.basename(path).rsplit(".", 1)[0])
+            with open(path, "r") as f:
+                first = json.loads(f.readline())
+                method = first.get("method", method)
+            all_runs.append((method, metrics, evals))
+
+        if not all_runs:
+            plt.close(fig)
+            return
+
+        colors = plt.cm.tab10(np.linspace(0, 1, max(len(all_runs), 1)))
+
+        def _smooth(vals, window=20):
+            if len(vals) < window:
+                return vals
+            kernel = np.ones(window) / window
+            return np.convolve(vals, kernel, mode="valid").tolist()
+
+        def _plot_line(ax, metrics, key, color, label, alpha=0.3, smooth_alpha=1.0, window=20):
+            steps = [m["step"] for m in metrics if key in m]
+            vals = [m[key] for m in metrics if key in m]
+            if not steps:
+                return
+            ax.plot(steps, vals, color=color, alpha=alpha, linewidth=0.5)
+            if len(vals) >= window:
+                smoothed = _smooth(vals, window)
+                ax.plot(steps[window - 1:], smoothed, color=color, linewidth=1.8, alpha=smooth_alpha, label=label)
+            else:
+                ax.plot(steps, vals, color=color, linewidth=1.2, alpha=smooth_alpha, label=label)
+
+        for run_idx, (method, metrics, evals) in enumerate(all_runs):
+            c = colors[run_idx]
+            steps = [m["step"] for m in metrics]
+
+            # ===== Row 1: Training quality =====
+
+            # (0,0) Reward
+            ax = axes[0][0]
+            _plot_line(ax, metrics, "reward", c, method)
+
+            # (0,1) Cumulative Reward
+            ax = axes[0][1]
+            _plot_line(ax, metrics, "cumulative_reward", c, method, alpha=0.8, smooth_alpha=1.0, window=1)
+
+            # (0,2) LM Loss
+            ax = axes[0][2]
+            _plot_line(ax, metrics, "lm_loss", c, method)
+
+            # (0,3) Eval Perplexity
+            ax = axes[0][3]
+            eval_steps = [e["step"] for e in evals if "eval_perplexity" in e]
+            eval_ppls = [e["eval_perplexity"] for e in evals if "eval_perplexity" in e]
+            if eval_steps:
+                ax.plot(eval_steps, eval_ppls, "-o", color=c, markersize=4, linewidth=1.5, label=method)
+
+            # ===== Row 2: Q-learning =====
+
+            # (1,0) TD Loss
+            ax = axes[1][0]
+            td_steps = [m["step"] for m in metrics if "td_loss" in m]
+            td_vals = [max(m["td_loss"], 1e-12) for m in metrics if "td_loss" in m]
+            if td_steps:
+                ax.semilogy(td_steps, td_vals, color=c, alpha=0.4, linewidth=0.5)
+                if len(td_vals) >= 20:
+                    smoothed = _smooth([math.log(v) for v in td_vals], 20)
+                    ax.semilogy(td_steps[19:], [math.exp(v) for v in smoothed], color=c, linewidth=1.8, label=method)
+
+            # (1,1) SGLD Q vs Random Q (the key unbiased comparison)
+            ax = axes[1][1]
+            sgld_q = [m["sgld_q_final_mean"] for m in metrics if "sgld_q_final_mean" in m]
+            rand_q = [m["q_random_mean"] for m in metrics if "q_random_mean" in m]
+            if sgld_q:
+                ax.plot(steps[:len(sgld_q)], sgld_q, color="red", alpha=0.3, linewidth=0.5)
+                if len(sgld_q) >= 20:
+                    ax.plot(steps[19:len(sgld_q)], _smooth(sgld_q, 20), color="red", linewidth=1.8, label="SGLD Q")
+            if rand_q:
+                ax.plot(steps[:len(rand_q)], rand_q, color="blue", alpha=0.3, linewidth=0.5)
+                if len(rand_q) >= 20:
+                    ax.plot(steps[19:len(rand_q)], _smooth(rand_q, 20), color="blue", linewidth=1.8, label="Random Q")
+
+            # (1,2) SGLD Q Gain (final - init per step)
+            ax = axes[1][2]
+            _plot_line(ax, metrics, "sgld_q_gain", c, method)
+            ax.axhline(y=0, color="black", linestyle="--", alpha=0.4)
+
+            # (1,3) Soft Value
+            ax = axes[1][3]
+            _plot_line(ax, metrics, "soft_value", c, method)
+
+            # ===== Row 3: SGLD health =====
+
+            # (2,0) SGLD Grad Norm
+            ax = axes[2][0]
+            _plot_line(ax, metrics, "sgld_grad_norm_mean", c, method)
+
+            # (2,1) Grad Clip Fraction
+            ax = axes[2][1]
+            _plot_line(ax, metrics, "sgld_grad_clip_frac", c, method)
+            ax.set_ylim(-0.05, 1.05)
+
+            # (2,2) Embedding Pairwise Cosine Similarity (lower = more diverse)
+            ax = axes[2][2]
+            _plot_line(ax, metrics, "sgld_embed_cosine_mean", c, method)
+
+            # (2,3) Token Unique Ratio (1.0 = all samples different)
+            ax = axes[2][3]
+            _plot_line(ax, metrics, "sgld_token_unique_ratio", c, method)
+            ax.set_ylim(-0.05, 1.05)
+
+            # ===== Row 4: RAG + diversity =====
+
+            # (3,0) RAG Top-1 Score
+            ax = axes[3][0]
+            _plot_line(ax, metrics, "rag_avg_top1_score", c, method)
+
+            # (3,1) Num Retrieved (unique)
+            ax = axes[3][1]
+            _plot_line(ax, metrics, "num_retrieved", c, method, alpha=0.6, smooth_alpha=1.0, window=1)
+
+            # (3,2) Token Jaccard Similarity (lower = more diverse)
+            ax = axes[3][2]
+            _plot_line(ax, metrics, "sgld_token_jaccard_mean", c, method)
+
+            # (3,3) SGLD Q Best
+            ax = axes[3][3]
+            _plot_line(ax, metrics, "sgld_q_best", c, method)
+
+            # ===== Row 5: Timing + resources =====
+
+            # (4,0) Time Breakdown (stacked area)
+            ax = axes[4][0]
+            t_sgld = [m.get("time_sgld_s", 0) for m in metrics]
+            t_rag = [m.get("time_rag_s", 0) for m in metrics]
+            t_lm = [m.get("time_lm_s", 0) for m in metrics]
+            t_rew = [m.get("time_reward_s", 0) for m in metrics]
+            if steps and t_sgld:
+                n = min(len(steps), len(t_sgld), len(t_rag), len(t_lm), len(t_rew))
+                ax.stackplot(
+                    steps[:n],
+                    t_sgld[:n], t_rag[:n], t_lm[:n], t_rew[:n],
+                    labels=["SGLD", "RAG", "LM Train", "Reward"],
+                    colors=["#e74c3c", "#3498db", "#2ecc71", "#f39c12"],
+                    alpha=0.7,
+                )
+
+            # (4,1) Step Time
+            ax = axes[4][1]
+            _plot_line(ax, metrics, "step_time", c, method)
+
+            # (4,2) GPU Peak Memory
+            ax = axes[4][2]
+            _plot_line(ax, metrics, "gpu_peak_mem_gb", c, method, alpha=0.6, smooth_alpha=1.0, window=1)
+            ax.set_ylabel("GB", fontsize=8)
+
+            # (4,3) LM + Q Grad Norms
+            ax = axes[4][3]
+            lm_gn = [m["lm_grad_norm"] for m in metrics if "lm_grad_norm" in m]
+            q_gn = [m["q_grad_norm"] for m in metrics if "q_grad_norm" in m]
+            if lm_gn:
+                ax.plot(steps[:len(lm_gn)], lm_gn, color="green", alpha=0.3, linewidth=0.5)
+                if len(lm_gn) >= 20:
+                    ax.plot(steps[19:len(lm_gn)], _smooth(lm_gn, 20), color="green", linewidth=1.5, label="LM grad")
+            if q_gn:
+                ax.plot(steps[:len(q_gn)], q_gn, color="purple", alpha=0.3, linewidth=0.5)
+                if len(q_gn) >= 20:
+                    ax.plot(steps[19:len(q_gn)], _smooth(q_gn, 20), color="purple", linewidth=1.5, label="Q grad")
+
+        # --- Titles and formatting ---
+        titles = [
+            # Row 1
+            "Reward (r_k)", "Cumulative Reward", "LM Loss", "Eval Perplexity",
+            # Row 2
+            "TD Loss", "SGLD Q vs Random Q", "SGLD Q Gain (final-init)", "Soft Value (V_k)",
+            # Row 3
+            "SGLD Grad Norm", "Grad Clip Fraction", "Embed Cosine Sim (lower=diverse)", "Token Unique Ratio",
+            # Row 4
+            "RAG Top-1 Score", "Num Retrieved", "Token Jaccard (lower=diverse)", "SGLD Best Q",
+            # Row 5
+            "Time Breakdown (s)", "Step Time (s)", "GPU Peak Memory (GB)", "LM / Q Grad Norms",
+        ]
+        for idx, title in enumerate(titles):
+            r, c = divmod(idx, 4)
+            ax = axes[r][c]
+            ax.set_title(title, fontsize=9, fontweight="bold")
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(labelsize=7)
+            if idx not in (8,):  # skip stacked area x-label
+                ax.set_xlabel("Step", fontsize=7)
+            if ax.get_legend_handles_labels()[1]:
+                ax.legend(fontsize=7, loc="best")
+
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        tmp_path = self.output_path + ".tmp.png"
+        fig.savefig(tmp_path, dpi=120, bbox_inches="tight")
+        os.replace(tmp_path, self.output_path)
+        plt.close(fig)
