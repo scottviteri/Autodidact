@@ -18,6 +18,14 @@ Q-learning formulation:
     the reward regardless of gamma (a constant reward r gives Q* = r + const).
     A target network with Polyak averaging stabilises the bootstrap target.
     gamma=0.9 gives an effective horizon of ~10 steps.
+
+LM training:
+    The LM always trains on a policy-weighted mixture of all N candidates,
+    where the weights are the Boltzmann policy pi = softmax(Q/beta). This
+    computes the expected gradient under the policy exactly, eliminating
+    variance from single-action sampling. When --no_q_weighting is used,
+    the weights are uniform (1/N), bypassing the Q-function for the LM step
+    while the Q-network still trains normally.
 """
 
 from dataclasses import dataclass
@@ -68,9 +76,9 @@ class AutodidactConfig:
     # --- Device ---
     device: Optional[str] = None
 
-    # --- Soft mixture training ---
-    soft_mixture: bool = False       # Train on policy-weighted mixture of all candidates
+    # --- Mixture training ---
     mixture_batch_size: int = 8      # Mini-batch size for gradient-accumulated mixture training
+    no_q_weighting: bool = False     # Use uniform weights instead of Q-derived Boltzmann weights for LM mixture
 
     # --- Baselines ---
     run_baselines: bool = False

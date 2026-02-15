@@ -94,6 +94,20 @@ The soft value in the TD target is computed from $Q_{\bar{\phi}}$, not $Q_\phi$.
 
 The key implementation insight is that each step's forward pass of candidates through the base model serves two purposes: action selection for the \emph{current} step and the bootstrap target for the \emph{previous} step's Q update. This avoids a redundant second forward pass.
 
+The LM trains on a \emph{policy-weighted mixture} of all $N$ candidates at every step, rather than on a single sampled action. Define the Boltzmann weights:
+\begin{equation}\label{eq:mixture_weights}
+    \pi_i = \frac{\exp(Q_\phi(s_k, x_i) / \beta)}{\sum_{j=1}^N \exp(Q_\phi(s_k, x_j) / \beta)}, \qquad x_i \in C_k.
+\end{equation}
+The LM loss is the policy-weighted mixture:
+\begin{equation}\label{eq:mixture_loss}
+    \mathcal{L}_{\text{mix}}(\theta; C_k) = \sum_{i=1}^{N} \pi_i \, \ell(\theta, x_i),
+\end{equation}
+where $\ell(\theta, x_i)$ is the per-token cross-entropy loss on candidate $x_i$. This is precisely the \emph{expected gradient} under the Boltzmann policy:
+\begin{equation}
+    \nabla_\theta \mathcal{L}_{\text{mix}} = \mathbb{E}_{x \sim \pi(\cdot \mid s_k)}\!\bigl[\nabla_\theta \ell(\theta_k, x)\bigr],
+\end{equation}
+computed exactly rather than estimated via a single Monte Carlo sample. This eliminates the variance from action sampling.
+
 \begin{algorithm}[h]
 \caption{Curriculum Selection via Normalised Discounted Soft Q-Learning}
 \begin{algorithmic}[1]
@@ -103,9 +117,10 @@ The key implementation insight is that each step's forward pass of candidates th
 \State $C_0 \gets \textsc{NextBatch}(\text{stream}, N)$
 \State $H_0 \gets \textsc{DetachedHidden}(\theta, C_0)$ \Comment{$[N, d]$ --- no grad into $\theta$}
 \State $q_0 \gets Q_\phi(H_0)$ \Comment{$[N, 1]$}
-\State $a_0 \gets \textsc{Sample}\bigl(\textsc{Softmax}(q_0 / \beta)\bigr)$
+\State $\pi_0 \gets \textsc{Softmax}(q_0 / \beta)$ \Comment{Boltzmann policy weights}
+\State $a_0 \gets \textsc{Sample}(\pi_0)$
 \State $h_{\text{prev}} \gets H_0[a_0]$ \Comment{Store hidden state of selected action}
-\State $\theta \gets \textsc{SGDStep}(\theta, C_0[a_0], \alpha, G)$ \Comment{LM update, clipped}
+\State $\theta \gets \theta - \alpha\, \nabla_\theta \sum_i \pi_{0,i}\, \ell(\theta, C_0[i])$ \Comment{Mixture LM update, clipped to $\|\nabla\| \le G$}
 \State $r_{\text{prev}} \gets \frac{1}{M}\log p_\theta(\hat{D}_0)$ \Comment{Reward after update}
 \Statex
 \For{$k = 1, 2, \ldots$} \textcolor{gray}{\textit{// Main loop}}
@@ -121,65 +136,45 @@ The key implementation insight is that each step's forward pass of candidates th
     \State Update $\phi$ to minimise $\frac{1}{2}(\hat{q} - y)^2$, clipped to $\|\nabla\| \le G$
     \State $\bar{\phi} \gets \tau\, \phi + (1 - \tau)\, \bar{\phi}$ \Comment{Polyak update}
     \Statex
-    \State \textcolor{gray}{\textit{// Action selection for current step}}
-    \State $a_k \gets \textsc{Sample}\bigl(\textsc{Softmax}(q_k / \beta)\bigr)$
+    \State \textcolor{gray}{\textit{// Action selection for current step (for Q-learning backup)}}
+    \State $\pi_k \gets \textsc{Softmax}(q_k / \beta)$ \Comment{Boltzmann policy weights}
+    \State $a_k \gets \textsc{Sample}(\pi_k)$
     \State $h_{\text{prev}} \gets H_k[a_k]$
     \Statex
-    \State \textcolor{gray}{\textit{// LM update and reward}}
-    \State $\theta \gets \textsc{SGDStep}(\theta, C_k[a_k], \alpha, G)$
+    \State \textcolor{gray}{\textit{// LM mixture update and reward}}
+    \State $\theta \gets \theta - \alpha\, \nabla_\theta \sum_i \pi_{k,i}\, \ell(\theta, C_k[i])$ \Comment{Mixture LM update, clipped to $\|\nabla\| \le G$}
     \State $r_k \gets \frac{1}{M}\log p_\theta(\hat{D}_k)$ \Comment{Fresh $\hat{D}_k \subset D$, reward after update}
     \State $r_{\text{prev}} \gets r_k$
 \EndFor
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Computational cost per step.} One forward pass of $N$ candidates through the base model (batched, no gradient); one forward-backward pass of the selected example for LM training; one forward pass of $M$ held-out examples for reward; one MLP forward-backward for the Q update; one MLP forward pass through the target network (negligible). The candidate forward pass dominates; the MLP and reward computations are comparatively cheap.
-
-\paragraph{Staleness.} The Q update at step $k$ uses the target network $Q_{\bar{\phi}}$ for the bootstrap value $V_k$, and the online network $Q_\phi$ for action selection. The target network lags the online network by $\sim\!1/\tau$ steps, which is by design: this lag stabilises the TD target. The online Q-values $q_k$ used for action selection have one-step staleness (computed before the $\phi$ update), which is standard in online Q-learning and negligible given the small MLP learning rate $\eta$.
-
-\subsection{Soft Mixture Training Variant}\label{sec:softmixture}
-
-In the base algorithm (Section~\ref{sec:algorithm}), the Boltzmann policy samples a single action $a_k \in C_k$ and the LM trains on that one example. This is sample-inefficient in a specific sense: at every step, $N$ candidates are already forwarded through the base model for Q-scoring, but only one of them contributes to the LM gradient update.
-
-\paragraph{Expected gradient under the policy.}
-An alternative is to train the LM on a \emph{policy-weighted mixture} of all $N$ candidates. Define the Boltzmann weights:
-\begin{equation}\label{eq:mixture_weights}
-    \pi_i = \frac{\exp(Q_\phi(s_k, x_i) / \beta)}{\sum_{j=1}^N \exp(Q_\phi(s_k, x_j) / \beta)}, \qquad x_i \in C_k.
-\end{equation}
-The LM loss becomes:
-\begin{equation}\label{eq:mixture_loss}
-    \mathcal{L}_{\text{mix}}(\theta; C_k) = \sum_{i=1}^{N} \pi_i \, \ell(\theta, x_i),
-\end{equation}
-where $\ell(\theta, x_i)$ is the per-token cross-entropy loss on candidate $x_i$. The LM gradient step is then:
-\begin{equation}
-    \theta_{k+1} = \theta_k - \alpha\, \nabla_\theta \mathcal{L}_{\text{mix}}(\theta_k; C_k).
-\end{equation}
-This is precisely the \emph{expected gradient} under the Boltzmann policy:
-\begin{equation}
-    \nabla_\theta \mathcal{L}_{\text{mix}} = \mathbb{E}_{x \sim \pi(\cdot \mid s_k)}\!\bigl[\nabla_\theta \ell(\theta_k, x)\bigr].
-\end{equation}
-In the base algorithm, the LM gradient is a single-sample Monte Carlo estimate of this expectation. The soft mixture computes it exactly, eliminating the variance from action sampling.
-
-\paragraph{Q-learning is unchanged.}
-The Q-network update proceeds exactly as in Section~\ref{sec:algorithm}: a discrete action $a_k$ is still sampled from the Boltzmann policy, its hidden state $h_{\text{prev}}$ is stored, and the standard TD update is applied at the next step. The Q-function continues to satisfy the discounted soft Bellman equation~\eqref{eq:bellman}. The only change is in how the environment \emph{transitions}: the LM parameters are updated via the full mixture rather than a single example.
+\paragraph{Q-learning and the mixture LM update.}
+The Q-network update is unchanged by the mixture formulation: a discrete action $a_k$ is still sampled from the Boltzmann policy, its hidden state $h_{\text{prev}}$ is stored, and the standard TD update is applied at the next step. The Q-function continues to satisfy the discounted soft Bellman equation~\eqref{eq:bellman}. The only difference from a single-action formulation is how the environment \emph{transitions}: the LM parameters are updated via the full mixture rather than a single example.
 
 \paragraph{Off-policy interpretation.}
 From the Q-learner's perspective, the situation is analogous to off-policy learning. The Q-learner observes: ``I selected action $a_k$, the environment transitioned to state $s_{k+1}$, and I received reward $r_k$.'' It does not need to know that the transition was caused by a mixture-weighted gradient step rather than a single-example step. Q-learning is inherently off-policy---the Bellman backup $Q(s, a) = (1-\gamma)\,r + \gamma\, V(s')$ is valid regardless of the behavior policy that generated the transition, as long as $r$ and $s'$ are the actual observed reward and next state.
 
-In this case, the ``behavior policy'' (the mixture-weighted LM update) is a smooth, deterministic function of the same Boltzmann policy that the Q-learner is evaluating. Over many steps, the Q-function converges to predict the value of upweighting a given candidate within the mixture---which is exactly the marginal contribution signal needed to set the mixture weights well.
+Over many steps, the Q-function converges to predict the value of upweighting a given candidate within the mixture---which is exactly the marginal contribution signal needed to set the mixture weights well.
 
-\paragraph{Computational cost.}
-The $N$ candidate forward passes for Q-scoring are already performed (under \texttt{torch.no\_grad}). The soft mixture additionally requires $N$ forward-backward passes through the full model for loss computation, processed in mini-batches with gradient accumulation. This replaces the single forward-backward pass of the base algorithm. The cost increase is a factor of $\sim\!N$ in the LM training portion of each step, but the LM training step was already cheap relative to the $N$ candidate forward passes and $M$ held-out forward passes. The net effect is roughly a $2\times$ increase in total step time (the candidate extraction forward passes, which dominate, are shared).
+\paragraph{Effective batch size.}
+The mixture-weighted update is equivalent to training on a soft batch of $\sim\!1/\|\pi\|_2^2$ effective examples per step (the inverse of the collision probability of the policy distribution). Early in training, when Q-values are similar, this approaches $N$; as the policy sharpens, the effective batch size decreases toward 1.
 
-\paragraph{When to use soft mixture training.}
-The soft mixture variant is most beneficial when:
-\begin{itemize}[nosep]
-    \item The number of candidates $N$ is moderate (the gradient accumulation cost scales linearly in $N$).
-    \item Variance reduction matters: early in training when Q-values are noisy, the expected gradient is more stable than a single-sample estimate.
-    \item The effective batch size increase is desirable: the mixture-weighted update is equivalent to training on a soft batch of $\sim\!1/\|\pi\|_2^2$ effective examples per step (the inverse of the collision probability of the policy distribution).
-\end{itemize}
+\paragraph{Computational cost per step.} One forward pass of $N$ candidates through the base model (batched, no gradient) for Q-scoring; $N$ forward-backward passes through the full model for the mixture LM loss (processed in mini-batches with gradient accumulation); one forward pass of $M$ held-out examples for reward; one MLP forward-backward for the Q update; one MLP forward pass through the target network (negligible). The candidate extraction forward passes dominate; the mixture LM step adds roughly a $2\times$ factor to total step time compared to a single-example LM step.
 
-The flag \texttt{--soft\_mixture} enables this variant. When disabled (the default), the algorithm reverts to single-action selection as in Algorithm~1.
+\paragraph{Staleness.} The Q update at step $k$ uses the target network $Q_{\bar{\phi}}$ for the bootstrap value $V_k$, and the online network $Q_\phi$ for action selection. The target network lags the online network by $\sim\!1/\tau$ steps, which is by design: this lag stabilises the TD target. The online Q-values $q_k$ used for action selection have one-step staleness (computed before the $\phi$ update), which is standard in online Q-learning and negligible given the small MLP learning rate $\eta$.
+
+\subsection{Uniform Mixture Variant (No Q-Weighting)}\label{sec:noqweighting}
+
+As an ablation, the flag \texttt{--no\_q\_weighting} replaces the Boltzmann policy weights with uniform weights:
+\begin{equation}
+    \pi_i = \frac{1}{N}, \qquad i = 1, \ldots, N.
+\end{equation}
+The LM loss becomes the unweighted average over all candidates:
+\begin{equation}
+    \mathcal{L}_{\text{uniform}}(\theta; C_k) = \frac{1}{N} \sum_{i=1}^{N} \ell(\theta, x_i).
+\end{equation}
+This decouples the LM training step from the Q-function entirely: the LM trains on an equal mixture of all candidates regardless of their Q-values. The Q-network still trains normally (receiving rewards, computing TD updates), but its output does not influence which data the LM learns from. This serves as a controlled ablation to isolate the effect of Q-weighted curriculum selection on sample efficiency.
 
 \subsection{Interpretation as Free-Energy Minimisation}\label{sec:freeenergy}
 

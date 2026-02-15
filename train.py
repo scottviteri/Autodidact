@@ -78,11 +78,11 @@ def parse_args() -> AutodidactConfig:
     # Device
     parser.add_argument("--device", type=str, default=None)
 
-    # Soft mixture training
-    parser.add_argument("--soft_mixture", action="store_true",
-                        help="Train on policy-weighted mixture of all N candidates instead of one")
+    # Mixture training
     parser.add_argument("--mixture_batch_size", type=int, default=8,
                         help="Mini-batch size for gradient-accumulated mixture training")
+    parser.add_argument("--no_q_weighting", action="store_true",
+                        help="Use uniform weights instead of Q-derived Boltzmann weights for LM mixture")
 
     # Baselines
     parser.add_argument("--run_baselines", action="store_true")
@@ -174,8 +174,8 @@ def main():
         use_wandb=config.use_wandb,
         wandb_project=config.wandb_project,
         device=config.device,
-        soft_mixture=config.soft_mixture,
         mixture_batch_size=config.mixture_batch_size,
+        no_q_weighting=config.no_q_weighting,
     )
     q_log = trainer.train(num_steps=config.num_steps)
     all_log_files.append(q_log)
