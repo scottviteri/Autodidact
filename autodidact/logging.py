@@ -94,7 +94,8 @@ def _read_log(log_path: str) -> tuple:
                 config = obj.get("config", {})
             elif t == "eval":
                 evals.append(obj)
-            else:
+            elif "step" in obj:
+                # Only include entries that have a step field (skip held_out, best_sample, etc.)
                 metrics.append(obj)
     return config, metrics, evals
 
