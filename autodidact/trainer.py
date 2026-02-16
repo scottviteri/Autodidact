@@ -28,7 +28,7 @@ import time
 import math
 
 from .q_network import QNetwork, extract_hidden_states, compute_soft_value, boltzmann_sample
-from .data import CandidateBatchSampler, HeldOutSet
+from .data import CandidateBatchSampler, HeldOutSet, TopicSimilarityTracker
 from .baselines import BaselineSelector
 from .logging import MetricsLogger, DashboardPlotter, LangevinRAGDashboard
 from .langevin_rag import LangevinQSampler, RAGIndex
@@ -398,6 +398,9 @@ class AutodidactTrainer:
             device=self.device,
         )
 
+        # --- Topic similarity tracker ---
+        topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
+
         cumulative_reward = 0.0
 
         # =====================================================================
@@ -520,19 +523,46 @@ class AutodidactTrainer:
                 "step_time": step_time,
             }
 
+            # --- Topic similarity: best-Q candidate vs held-out ---
+            if k % self.log_interval == 0:
+                best_q_idx = q_squeezed.argmax().item()
+                candidate_texts = [
+                    self.tokenizer.decode(C_k[i].cpu().tolist())
+                    for i in range(C_k.shape[0])
+                ]
+                tsim = topic_tracker.compute_similarities(candidate_texts)
+                metrics["best_q_topic_sim"] = float(tsim["sims"][best_q_idx])
+                metrics["selected_topic_sim"] = float(tsim["sims"][a_k])
+                metrics["mean_topic_sim"] = tsim["mean_sim"]
+                metrics["max_topic_sim"] = tsim["best_sim"]
+
             # --- Always log to JSONL ---
             logger.log(metrics)
 
             # --- Print to stdout periodically ---
             if k % self.log_interval == 0:
+                topic_msg = ""
+                if "best_q_topic_sim" in metrics:
+                    topic_msg = f" | topic_sim={metrics['best_q_topic_sim']:.4f}"
                 print(
                     f"Step {k:6d} | reward={r_k:.4f} | "
                     f"lm_loss={lm_loss:.4f} | td={td_loss:.6f} | "
                     f"ent={entropy:.3f}/{max_entropy:.3f} | "
                     f"Q={q_k.mean().item():.4f}+/-{q_k.std().item():.4f} | "
                     f"gnorm_lm={lm_grad_norm:.3f} gnorm_q={q_grad_norm:.3f} | "
-                    f"{step_time:.2f}s"
+                    f"{step_time:.2f}s{topic_msg}"
                 )
+
+                # Log best-Q candidate text
+                best_q_text = candidate_texts[best_q_idx]
+                logger.log({
+                    "_type": "best_q_sample",
+                    "step": k,
+                    "best_q_text": best_q_text[:500],
+                    "best_q_topic_sim": metrics.get("best_q_topic_sim", 0.0),
+                })
+                print(f"  [Best-Q (sim={metrics.get('best_q_topic_sim', 0):.4f})]: "
+                      f"{best_q_text[:150]}")
 
                 if self.use_wandb:
                     import wandb
@@ -1121,6 +1151,9 @@ class LangevinRAGTrainer:
             device=self.device,
         )
 
+        # --- Topic similarity tracker ---
+        topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
+
         cumulative_reward = 0.0
 
         # =====================================================================
@@ -1313,11 +1346,37 @@ class LangevinRAGTrainer:
                 "gpu_peak_mem_gb": gpu_mem_gb,
             }
 
+            # --- Topic similarity: best-Q SGLD query + retrieved examples vs held-out ---
+            if k % self.log_interval == 0:
+                best_idx = langevin_info["best_q_sample_idx"]
+                best_q_text = self.tokenizer.decode(query_ids[best_idx].tolist())
+                # Compute topic sim for SGLD query sentences
+                query_texts = [
+                    self.tokenizer.decode(query_ids[i].tolist())
+                    for i in range(query_ids.shape[0])
+                ]
+                tsim_query = topic_tracker.compute_similarities(query_texts)
+                metrics["best_q_topic_sim"] = float(tsim_query["sims"][best_idx])
+                metrics["mean_query_topic_sim"] = tsim_query["mean_sim"]
+                metrics["max_query_topic_sim"] = tsim_query["best_sim"]
+
+                # Compute topic sim for retrieved examples
+                retrieved_texts = [
+                    self.tokenizer.decode(retrieved_ids[i].cpu().tolist())
+                    for i in range(retrieved_ids.shape[0])
+                ]
+                tsim_retrieved = topic_tracker.compute_similarities(retrieved_texts)
+                metrics["best_retrieved_topic_sim"] = tsim_retrieved["best_sim"]
+                metrics["mean_retrieved_topic_sim"] = tsim_retrieved["mean_sim"]
+
             logger.log(metrics)
 
             if k % self.log_interval == 0:
                 sgld_pct = langevin_info["sgld_time_s"] / max(step_time, 1e-6) * 100
                 lm_pct = lm_time / max(step_time, 1e-6) * 100
+                topic_msg = ""
+                if "best_q_topic_sim" in metrics:
+                    topic_msg = f" | topic_sim={metrics['best_q_topic_sim']:.4f}"
                 print(
                     f"[LangevinRAG] Step {k:6d} | reward={r_k:.4f} | "
                     f"lm_loss={lm_loss:.4f} | td={td_loss:.6f} | "
@@ -1327,7 +1386,7 @@ class LangevinRAGTrainer:
                     f"snap_cos={langevin_info['snap_cosine_mean']:.3f} | "
                     f"retr={rag_info['num_retrieved_unique']} | "
                     f"{step_time:.2f}s "
-                    f"[sgld={sgld_pct:.0f}% lm={lm_pct:.0f}%]"
+                    f"[sgld={sgld_pct:.0f}% lm={lm_pct:.0f}%]{topic_msg}"
                 )
                 if self.use_wandb:
                     import wandb
@@ -1335,15 +1394,15 @@ class LangevinRAGTrainer:
 
             # --- Periodic best-Q sample text ---
             if k % self.log_interval == 0:
-                best_idx = langevin_info["best_q_sample_idx"]
-                best_q_text = self.tokenizer.decode(query_ids[best_idx].tolist())
                 best_q_val = langevin_info["q_best"]
-                print(f"  [Best-Q sample (Q={best_q_val:.4f})]: {best_q_text[:200]}")
+                print(f"  [Best-Q sample (Q={best_q_val:.4f}, "
+                      f"sim={metrics.get('best_q_topic_sim', 0):.4f})]: {best_q_text[:200]}")
                 logger.log({
                     "_type": "best_sample",
                     "step": k,
                     "best_q_value": best_q_val,
                     "best_q_text": best_q_text[:500],
+                    "best_q_topic_sim": metrics.get("best_q_topic_sim", 0.0),
                     "sample_query_0": rag_info.get("sample_query", "")[:200],
                 })
 

@@ -104,7 +104,7 @@ class DashboardPlotter:
     Renders a 4x4 (16-panel) live dashboard from one or more JSONL log files.
     
     Panels (row-major):
-      Row 1: Reward (r_k)          | Cumulative Reward       | LM Loss              | Eval Perplexity
+      Row 1: Reward (r_k)          | Topic Similarity        | LM Loss              | Eval Perplexity
       Row 2: TD Loss               | Q-value Mean            | Q-value Std           | Soft Value (V_k)
       Row 3: Policy Entropy        | Entropy Ratio           | Selected Action Hist  | Q-value Min/Max
       Row 4: Step Time (s)         | Q Grad Norm             | LM Grad Norm          | (empty)
@@ -114,11 +114,11 @@ class DashboardPlotter:
     """
 
     # Panel layout: (title, y_key, plot_type)
-    # plot_type: "line", "semilogy", "hist", "eval_line"
+    # plot_type: "line", "semilogy", "hist", "eval_line", "topic_sim"
     PANELS = [
         # Row 1
         ("Reward (r_k)",           "reward",               "line"),
-        ("Cumulative Reward",     "cumulative_reward",    "line"),
+        ("Topic Similarity",       "best_q_topic_sim",     "topic_sim"),
         ("LM Loss",               "lm_loss",              "line"),
         ("Eval Perplexity",       "eval_perplexity",      "eval_line"),
         # Row 2
@@ -203,6 +203,29 @@ class DashboardPlotter:
                         # Clamp to positive for log scale
                         vals_pos = [max(v, 1e-12) for v in vals]
                         ax.semilogy(steps, vals_pos, color=color, label=label, linewidth=1.0, alpha=0.8)
+                elif ptype == "topic_sim":
+                    # Topic similarity: best-Q, selected, and pool mean
+                    best_steps = [m["step"] for m in metrics if "best_q_topic_sim" in m]
+                    best_vals = [m["best_q_topic_sim"] for m in metrics if "best_q_topic_sim" in m]
+                    sel_vals = [m["selected_topic_sim"] for m in metrics if "selected_topic_sim" in m]
+                    mean_vals = [m["mean_topic_sim"] for m in metrics if "mean_topic_sim" in m]
+                    if best_vals:
+                        ax.plot(best_steps, best_vals, color="red", alpha=0.3, linewidth=0.5)
+                        ax.plot(best_steps[:len(sel_vals)], sel_vals, color="orange", alpha=0.3, linewidth=0.5)
+                        if mean_vals:
+                            ax.plot(best_steps[:len(mean_vals)], mean_vals, color="gray", alpha=0.5, linewidth=0.8, label="Pool mean")
+                        # Smoothed lines
+                        sw = 10
+                        if len(best_vals) >= sw:
+                            kernel = np.ones(sw) / sw
+                            ax.plot(best_steps[sw-1:], np.convolve(best_vals, kernel, mode="valid"),
+                                    color="red", linewidth=1.8, label="Best-Q")
+                        if len(sel_vals) >= sw:
+                            kernel = np.ones(sw) / sw
+                            ax.plot(best_steps[sw-1:len(sel_vals)], np.convolve(sel_vals, kernel, mode="valid"),
+                                    color="orange", linewidth=1.8, label="Selected")
+                        ax.set_ylim(-0.1, 1.05)
+                    ax.legend(fontsize=7, loc="best")
                 else:  # "line"
                     steps = [m["step"] for m in metrics if key in m]
                     vals = [m[key] for m in metrics if key in m]
@@ -212,7 +235,7 @@ class DashboardPlotter:
                 if ptype != "hist":
                     ax.set_xlabel("Step", fontsize=8)
 
-            if len(all_runs) > 1:
+            if len(all_runs) > 1 and ptype != "topic_sim":
                 ax.legend(fontsize=7, loc="best")
 
         fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -230,7 +253,7 @@ class LangevinRAGDashboard:
 
     Panels (row-major):
       Row 1 — Training quality:
-        Reward               | Cumulative Reward     | LM Loss              | Eval Perplexity
+        Reward               | Topic Similarity      | LM Loss              | Eval Perplexity
       Row 2 — Q-learning:
         TD Loss              | SGLD Q vs Random Q    | SGLD Q Gain          | Soft Value
       Row 3 — SGLD health:
@@ -300,9 +323,25 @@ class LangevinRAGDashboard:
             ax = axes[0][0]
             _plot_line(ax, metrics, "reward", c, method)
 
-            # (0,1) Cumulative Reward
+            # (0,1) Topic Similarity (best-Q query + retrieved vs held-out)
             ax = axes[0][1]
-            _plot_line(ax, metrics, "cumulative_reward", c, method, alpha=0.8, smooth_alpha=1.0, window=1)
+            best_q_sims = [m["best_q_topic_sim"] for m in metrics if "best_q_topic_sim" in m]
+            mean_q_sims = [m["mean_query_topic_sim"] for m in metrics if "mean_query_topic_sim" in m]
+            best_r_sims = [m["best_retrieved_topic_sim"] for m in metrics if "best_retrieved_topic_sim" in m]
+            mean_r_sims = [m["mean_retrieved_topic_sim"] for m in metrics if "mean_retrieved_topic_sim" in m]
+            sim_steps = [m["step"] for m in metrics if "best_q_topic_sim" in m]
+            if best_q_sims:
+                ax.plot(sim_steps, best_q_sims, color="red", alpha=0.3, linewidth=0.5)
+                if len(best_q_sims) >= 20:
+                    ax.plot(sim_steps[19:], _smooth(best_q_sims, 20), color="red", linewidth=1.8, label="Best-Q query")
+            if best_r_sims:
+                ax.plot(sim_steps[:len(best_r_sims)], best_r_sims, color="green", alpha=0.3, linewidth=0.5)
+                if len(best_r_sims) >= 20:
+                    ax.plot(sim_steps[19:len(best_r_sims)], _smooth(best_r_sims, 20), color="green", linewidth=1.8, label="Best retrieved")
+            if mean_r_sims:
+                ax.plot(sim_steps[:len(mean_r_sims)], mean_r_sims, color="gray", alpha=0.5, linewidth=0.8, label="Mean retrieved")
+            ax.set_ylim(-0.1, 1.05)
+            ax.legend(fontsize=6, loc="best")
 
             # (0,2) LM Loss
             ax = axes[0][2]
@@ -429,7 +468,7 @@ class LangevinRAGDashboard:
         # --- Titles and formatting ---
         titles = [
             # Row 1
-            "Reward (r_k)", "Cumulative Reward", "LM Loss", "Eval Perplexity",
+            "Reward (r_k)", "Topic Similarity to Held-Out", "LM Loss", "Eval Perplexity",
             # Row 2
             "TD Loss", "SGLD Q vs Random Q", "SGLD Q Gain (final-init)", "Soft Value (V_k)",
             # Row 3
