@@ -92,11 +92,11 @@ class AutodidactConfig:
 
     # --- Langevin-RAG mode (default) ---
     langevin_rag: bool = True         # Use Langevin Q-guided search + RAG retrieval
-    langevin_seq_len: int = 128        # Sequence length for Langevin embedding optimization
+    langevin_seq_len: int = 64        # Sequence length for Langevin embedding optimization
     langevin_num_chains: int = 128      # K: parallel Langevin chains
     langevin_num_samples: int = 128     # Total samples to collect from Langevin
-    langevin_steps: int = 100         # Total Langevin steps (burn-in + collection)
-    langevin_burn_in: int = 80        # Discard first N steps
+    langevin_steps: int = 50         # Total Langevin steps (burn-in + collection)
+    langevin_burn_in: int = 40        # Discard first N steps
     langevin_thin: int = 10            # Keep every N-th sample after burn-in
     langevin_step_size: float = 0.01  # Langevin step size epsilon
     langevin_temperature: float = 1.0 # Sampling temperature (scales energy)
