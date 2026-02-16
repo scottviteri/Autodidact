@@ -27,7 +27,7 @@ from typing import Optional, Dict, Any, List
 import time
 import math
 
-from .q_network import QNetwork, extract_hidden_states, compute_soft_value, boltzmann_sample
+from .q_network import QNetwork, extract_hidden_states, extract_hidden_state_with_grad, compute_soft_value, boltzmann_sample
 from .data import CandidateBatchSampler, HeldOutSet, TopicSimilarityTracker
 from .baselines import BaselineSelector
 from .logging import MetricsLogger, DashboardPlotter, LangevinRAGDashboard
@@ -134,6 +134,9 @@ class AutodidactTrainer:
         no_q_weighting: bool = False,
         # Ablation: reset LM weights each step (only Q learns)
         reset_lm_each_step: bool = False,
+        # TD-into-theta: let TD gradients shape LM representations
+        td_into_theta: bool = False,
+        td_lambda: float = 1.0,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"Using device: {self.device}")
@@ -184,6 +187,13 @@ class AutodidactTrainer:
         # --- Reset LM each step (ablation: only Q learns across steps) ---
         self.reset_lm_each_step = reset_lm_each_step
 
+        # --- TD-into-theta ---
+        self.td_into_theta = td_into_theta
+        self.td_lambda = td_lambda
+        if td_into_theta:
+            print(f"[td_into_theta] TD gradients will flow into theta (lambda={td_lambda}). "
+                  "Representations shaped by both LM loss and Q-learning TD loss.")
+
         # --- Logging ---
         self.log_dir = log_dir
         self.use_wandb = use_wandb
@@ -193,6 +203,8 @@ class AutodidactTrainer:
         method_name = "q_learning_uniform_mixture" if no_q_weighting else "q_learning"
         if reset_lm_each_step:
             method_name += "_reset_lm"
+        if td_into_theta:
+            method_name += "_td_into_theta"
         self._config_dict = {
             "method_name": method_name,
             "model_name": model_name,
@@ -213,6 +225,8 @@ class AutodidactTrainer:
             "no_q_weighting": no_q_weighting,
             "mixture_batch_size": mixture_batch_size,
             "reset_lm_each_step": reset_lm_each_step,
+            "td_into_theta": td_into_theta,
+            "td_lambda": td_lambda,
         }
 
         if use_wandb:
@@ -294,9 +308,17 @@ class AutodidactTrainer:
         as the reward regardless of gamma. V_target is computed from the target
         network (Polyak-averaged copy) for stability.
         
-        Returns (td_loss_value, q_grad_norm_before_clip).
+        When td_into_theta is enabled, h_prev carries gradients back into theta,
+        so backward() computes gradients for both phi and theta. The theta
+        gradients are scaled by td_lambda before the LM optimizer steps. This
+        gives the LM a secondary objective: make its representations Q-predictable.
+        
+        Returns (td_loss_value, q_grad_norm, lm_td_grad_norm).
+            lm_td_grad_norm is 0.0 when td_into_theta is disabled.
         """
         self.q_optimizer.zero_grad()
+        if self.td_into_theta:
+            self.lm_optimizer.zero_grad()
 
         # Re-evaluate previous action with current phi
         q_hat = self.q_net(h_prev.unsqueeze(0)).squeeze()  # scalar
@@ -304,16 +326,35 @@ class AutodidactTrainer:
         # TD target (stop gradient; V computed from target network)
         y = (1 - self.gamma) * r_prev + self.gamma * soft_value_next.detach()
 
-        # TD loss
+        # TD loss (optionally scaled for theta gradients)
         td_loss = 0.5 * (q_hat - y) ** 2
-        td_loss.backward()
+        if self.td_into_theta and self.td_lambda != 1.0:
+            # Scale the loss so theta gets td_lambda * gradient, but phi gets 1x.
+            # We achieve this by scaling the loss, stepping phi, then correcting.
+            # Simpler: backward with full loss, then scale theta grads manually.
+            td_loss.backward()
+            # Scale theta gradients by td_lambda
+            with torch.no_grad():
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(self.td_lambda)
+        else:
+            td_loss.backward()
+
         q_grad_norm = torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), self.q_grad_clip).item()
         self.q_optimizer.step()
+
+        lm_td_grad_norm = 0.0
+        if self.td_into_theta:
+            lm_td_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grad_clip
+            ).item()
+            self.lm_optimizer.step()
 
         # Polyak update: target <- tau * online + (1 - tau) * target
         self._polyak_update()
 
-        return td_loss.item(), q_grad_norm
+        return td_loss.item(), q_grad_norm, lm_td_grad_norm
 
     @torch.no_grad()
     def _polyak_update(self):
@@ -423,6 +464,8 @@ class AutodidactTrainer:
         a_0 = boltzmann_sample(q_0, self.beta)
 
         h_prev = H_0[a_0]
+        # Store token IDs for re-forward when td_into_theta is enabled
+        prev_action_ids = C_0[a_0].clone() if self.td_into_theta else None
 
         # LM update: policy-weighted mixture of all candidates
         if self.no_q_weighting:
@@ -481,13 +524,22 @@ class AutodidactTrainer:
             with torch.no_grad():
                 q_k_target = self.q_target(H_k)
             V_k_target = compute_soft_value(q_k_target, self.beta)
-            td_loss, q_grad_norm = self._q_step(h_prev, r_prev, V_k_target)
+
+            # When td_into_theta is enabled, re-forward the previous action
+            # through the current theta WITH gradients, so TD loss shapes theta.
+            if self.td_into_theta:
+                h_prev_for_td = extract_hidden_state_with_grad(self.model, prev_action_ids)
+            else:
+                h_prev_for_td = h_prev
+            td_loss, q_grad_norm, lm_td_grad_norm = self._q_step(h_prev_for_td, r_prev, V_k_target)
 
             # --- Action selection for current step ---
             # A discrete action is still sampled for the Q-learning Bellman backup,
             # even though the LM trains on the full mixture of all candidates.
             a_k = boltzmann_sample(q_k, self.beta)
             h_prev = H_k[a_k]
+            if self.td_into_theta:
+                prev_action_ids = C_k[a_k].clone()
 
             # --- LM update: policy-weighted mixture of all candidates ---
             if self.no_q_weighting:
@@ -532,6 +584,8 @@ class AutodidactTrainer:
                 "selected_action": a_k,
                 "step_time": step_time,
             }
+            if self.td_into_theta:
+                metrics["lm_td_grad_norm"] = lm_td_grad_norm
 
             # --- Topic similarity: best-Q candidate vs held-out ---
             if k % self.log_interval == 0:
@@ -871,6 +925,9 @@ class LangevinRAGTrainer:
         reset_lm_each_step: bool = False,
         # Q-head warmup
         q_warmup_steps: int = 0,
+        # TD-into-theta: let TD gradients shape LM representations
+        td_into_theta: bool = False,
+        td_lambda: float = 1.0,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"[LangevinRAG] Using device: {self.device}")
@@ -927,6 +984,12 @@ class LangevinRAGTrainer:
         # --- Q-head warmup ---
         self.q_warmup_steps = q_warmup_steps
 
+        # --- TD-into-theta ---
+        self.td_into_theta = td_into_theta
+        self.td_lambda = td_lambda
+        if td_into_theta:
+            print(f"[LangevinRAG td_into_theta] TD gradients will flow into theta (lambda={td_lambda}).")
+
         # --- Langevin sampler ---
         self.langevin_sampler = LangevinQSampler(
             model=self.model,
@@ -967,6 +1030,8 @@ class LangevinRAGTrainer:
         method_name = "langevin_rag"
         if reset_lm_each_step:
             method_name += "_reset_lm"
+        if td_into_theta:
+            method_name += "_td_into_theta"
         self._config_dict = {
             "method_name": method_name,
             "model_name": model_name,
@@ -996,6 +1061,8 @@ class LangevinRAGTrainer:
             "rag_top_k": rag_top_k,
             "reset_lm_each_step": reset_lm_each_step,
             "q_warmup_steps": q_warmup_steps,
+            "td_into_theta": td_into_theta,
+            "td_lambda": td_lambda,
             # Dimensionality info for dashboard reference lines
             "rag_embed_dim": self._rag_embed_dim,
             "wte_hidden_dim": self._wte_hidden_dim,
@@ -1041,19 +1108,39 @@ class LangevinRAGTrainer:
     ) -> tuple:
         """
         Q-network update (normalised discounted soft Bellman).
-        Same as AutodidactTrainer._q_step.
+        Same structure as AutodidactTrainer._q_step with td_into_theta support.
+
+        Returns (td_loss_value, q_grad_norm, lm_td_grad_norm).
         """
         self.q_optimizer.zero_grad()
+        if self.td_into_theta:
+            self.lm_optimizer.zero_grad()
+
         q_hat = self.q_net(h_prev.unsqueeze(0)).squeeze()
         y = (1 - self.gamma) * r_prev + self.gamma * soft_value_next.detach()
         td_loss = 0.5 * (q_hat - y) ** 2
         td_loss.backward()
+
+        if self.td_into_theta and self.td_lambda != 1.0:
+            with torch.no_grad():
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        p.grad.mul_(self.td_lambda)
+
         q_grad_norm = torch.nn.utils.clip_grad_norm_(
             self.q_net.parameters(), self.q_grad_clip
         ).item()
         self.q_optimizer.step()
+
+        lm_td_grad_norm = 0.0
+        if self.td_into_theta:
+            lm_td_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grad_clip
+            ).item()
+            self.lm_optimizer.step()
+
         self._polyak_update()
-        return td_loss.item(), q_grad_norm
+        return td_loss.item(), q_grad_norm, lm_td_grad_norm
 
     def _lm_step_batch(self, batch_ids: torch.Tensor, micro_batch_size: Optional[int] = None) -> tuple:
         """
@@ -1262,10 +1349,11 @@ class LangevinRAGTrainer:
                 q_warmup = self.q_net(H_warmup)
 
                 # 3. Q update for previous transition
+                # (warmup always uses detached h_prev — no td_into_theta during warmup)
                 with torch.no_grad():
                     q_warmup_target = self.q_target(H_warmup)
                 V_target = compute_soft_value(q_warmup_target, self.beta)
-                td_loss, q_grad_norm = self._q_step(h_prev, r_prev, V_target)
+                td_loss, q_grad_norm, _ = self._q_step(h_prev, r_prev, V_target)
 
                 # Track h_prev for next step's Q update
                 h_prev = H_warmup[0].detach()
@@ -1353,6 +1441,8 @@ class LangevinRAGTrainer:
         h_prev = extract_hidden_states(
             self.model, retrieved_ids[:1], batch_size=1
         ).squeeze(0)  # [d]
+        # Store token IDs for re-forward when td_into_theta is enabled
+        prev_action_ids = retrieved_ids[0].clone() if self.td_into_theta else None
 
         # LM training on retrieved examples (unweighted)
         t_lm = time.time()
@@ -1446,9 +1536,18 @@ class LangevinRAGTrainer:
             with torch.no_grad():
                 q_retrieved_target = self.q_target(H_retrieved)
             V_target = compute_soft_value(q_retrieved_target, self.beta)
-            td_loss, q_grad_norm = self._q_step(h_prev, r_prev, V_target)
+
+            # When td_into_theta is enabled, re-forward the previous action
+            # through the current theta WITH gradients, so TD loss shapes theta.
+            if self.td_into_theta:
+                h_prev_for_td = extract_hidden_state_with_grad(self.model, prev_action_ids)
+            else:
+                h_prev_for_td = h_prev
+            td_loss, q_grad_norm, lm_td_grad_norm = self._q_step(h_prev_for_td, r_prev, V_target)
 
             h_prev = H_retrieved[0].detach()
+            if self.td_into_theta:
+                prev_action_ids = retrieved_ids[0].clone()
 
             # --- 4. LM training on retrieved examples (unweighted) ---
             t_lm = time.time()
@@ -1519,6 +1618,8 @@ class LangevinRAGTrainer:
                 # GPU memory
                 "gpu_peak_mem_gb": gpu_mem_gb,
             }
+            if self.td_into_theta:
+                metrics["lm_td_grad_norm"] = lm_td_grad_norm
 
             # --- Topic similarity: best-Q SGLD query + retrieved examples vs held-out ---
             if k % self.log_interval == 0:

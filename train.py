@@ -142,6 +142,12 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--q_warmup_steps", type=int, default=_defaults.q_warmup_steps,
                         help="Number of warmup steps: random data + theta reset, only Q learns")
 
+    # TD-into-theta
+    parser.add_argument("--td_into_theta", action="store_true",
+                        help="Let TD loss gradients flow into theta (LM weights), shaping representations for Q-prediction")
+    parser.add_argument("--td_lambda", type=float, default=_defaults.td_lambda,
+                        help="Scaling coefficient for TD gradients flowing into theta (1.0 = full strength)")
+
     args = parser.parse_args()
     return AutodidactConfig(**vars(args))
 
@@ -239,6 +245,8 @@ def main():
             device=config.device,
             reset_lm_each_step=config.reset_lm_each_step,
             q_warmup_steps=config.q_warmup_steps,
+            td_into_theta=config.td_into_theta,
+            td_lambda=config.td_lambda,
         )
         log_file = trainer.train(num_steps=config.num_steps)
         all_log_files.append(log_file)
@@ -275,6 +283,8 @@ def main():
         mixture_batch_size=config.mixture_batch_size,
         no_q_weighting=config.no_q_weighting,
         reset_lm_each_step=config.reset_lm_each_step,
+        td_into_theta=config.td_into_theta,
+        td_lambda=config.td_lambda,
     )
     q_log = trainer.train(num_steps=config.num_steps)
     all_log_files.append(q_log)

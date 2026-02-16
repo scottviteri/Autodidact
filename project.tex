@@ -34,6 +34,7 @@ We propose an algorithm that enables language models to learn what data to learn
     \item Discount factor $\gamma \in (0, 1)$ controlling the effective planning horizon
     \item Polyak averaging rate $\tau \in (0, 1)$ for the target network update
     \item Gradient clipping threshold $G$ (max global norm; applied to both LM and Q-network gradient steps)
+    \item Optional: TD-into-theta flag and scaling coefficient $\lambda_{\text{TD}}$ for representation shaping (Section~\ref{sec:td_into_theta})
 \end{itemize}
 
 \subsection{State, Action, and Reward}\label{sec:sar}
@@ -63,7 +64,7 @@ The Q-network reads the base model's internal representations to assess candidat
     where $\phi = \{W_1 \in \mathbb{R}^{32 \times d},\; b_1 \in \mathbb{R}^{32},\; W_2 \in \mathbb{R}^{1 \times 32},\; b_2 \in \mathbb{R}\}$ and $\sigma$ is ReLU.
 \end{enumerate}
 
-The hidden state $h_x$ implicitly encodes both the model's current state (through $\theta_k$, which determines the representations) and the identity of the candidate (through the input $x$). By detaching $h_x$, we ensure that $\theta$ is updated only by the language modeling objective, while $\phi$ is updated only by the TD loss. This prevents the co-adaptation instability that arises when value gradients distort the base model's representations.
+The hidden state $h_x$ implicitly encodes both the model's current state (through $\theta_k$, which determines the representations) and the identity of the candidate (through the input $x$). By default, $h_x$ is detached from the computation graph, ensuring that $\theta$ is updated only by the language modeling objective while $\phi$ is updated only by the TD loss. This prevents the co-adaptation instability that arises when value gradients distort the base model's representations. Section~\ref{sec:td_into_theta} describes an optional mode that relaxes this separation.
 
 \subsection{Normalised Discounted Soft Bellman Equation}\label{sec:discount}
 
@@ -132,8 +133,9 @@ computed exactly rather than estimated via a single Monte Carlo sample. This eli
     \State $\bar{q}_k \gets Q_{\bar{\phi}}(H_k)$ \Comment{Target network Q-values, no gradient}
     \State $V_{k} \gets \beta \bigl[\log \sum_{a'} \exp\bigl(\bar{q}_k[a'] / \beta\bigr) - \log N\bigr]$ \Comment{Normalised soft value from target network}
     \State $y \gets (1 - \gamma)\, r_{\text{prev}} + \gamma\, V_{k}$ \Comment{Normalised TD target, stop-gradient}
+    \State $h_{\text{prev}} \gets \textsc{Hidden}(\theta, a_{\text{prev}})$ \Comment{Detached by default; with-grad if \texttt{--td\_into\_theta} (Sec.~\ref{sec:td_into_theta})}
     \State $\hat{q} \gets Q_\phi(h_{\text{prev}})$ \Comment{Re-evaluate previous action with current $\phi$}
-    \State Update $\phi$ to minimise $\frac{1}{2}(\hat{q} - y)^2$, clipped to $\|\nabla\| \le G$
+    \State Update $\phi$ (and optionally $\theta$) to minimise $\frac{1}{2}(\hat{q} - y)^2$, clipped to $\|\nabla\| \le G$
     \State $\bar{\phi} \gets \tau\, \phi + (1 - \tau)\, \bar{\phi}$ \Comment{Polyak update}
     \Statex
     \State \textcolor{gray}{\textit{// Action selection for current step (for Q-learning backup)}}
@@ -175,6 +177,32 @@ The LM loss becomes the unweighted average over all candidates:
     \mathcal{L}_{\text{uniform}}(\theta; C_k) = \frac{1}{N} \sum_{i=1}^{N} \ell(\theta, x_i).
 \end{equation}
 This decouples the LM training step from the Q-function entirely: the LM trains on an equal mixture of all candidates regardless of their Q-values. The Q-network still trains normally (receiving rewards, computing TD updates), but its output does not influence which data the LM learns from. This serves as a controlled ablation to isolate the effect of Q-weighted curriculum selection on sample efficiency.
+
+\subsection{TD Gradients into Theta (Representation Shaping)}\label{sec:td_into_theta}
+
+By default, the hidden states $h_x$ used by the Q-network are detached from $\theta$, so the TD loss $\frac{1}{2}(\hat{q} - y)^2$ only updates the Q-network parameters $\phi$. This creates a one-directional dependency: $\theta$ determines the representations that $\phi$ reads, but $\phi$'s learning signal never shapes $\theta$. If $\theta$ changes quickly (e.g.\ under a high LM learning rate), the Q-head may struggle to track the shifting representation landscape.
+
+The flag \texttt{--td\_into\_theta} enables a bidirectional coupling: during the TD update, the previous action's hidden state is recomputed through the current $\theta$ \emph{with} gradients, so that $\nabla_\theta \mathcal{L}_{\text{TD}}$ is nonzero and flows into $\theta$ via the LM optimizer. This gives $\theta$ a secondary objective: produce representations that are informative for Q-value prediction.
+
+Concretely, at step $k$ the Q update becomes:
+\begin{enumerate}[nosep]
+    \item Re-forward the previous action's tokens $a_{k-1}$ through the current model $\theta_k$ \emph{with gradients}:
+    \[
+        h_{\text{prev}} = \texttt{last\_hidden}(\theta_k, a_{k-1}) \in \mathbb{R}^d. \qquad \text{(grad-connected to } \theta_k\text{)}
+    \]
+    \item Compute the TD loss as before:
+    \[
+        \mathcal{L}_{\text{TD}} = \tfrac{1}{2}\bigl(Q_\phi(h_{\text{prev}}) - y\bigr)^2, \qquad y = (1 - \gamma)\,r_{\text{prev}} + \gamma\,V_{\bar{\phi}}(s_k).
+    \]
+    \item Backpropagate: $\nabla_\phi \mathcal{L}_{\text{TD}}$ updates $\phi$ as usual; $\lambda_{\text{TD}}\,\nabla_\theta \mathcal{L}_{\text{TD}}$ updates $\theta$ via the LM optimizer.
+\end{enumerate}
+The coefficient $\lambda_{\text{TD}}$ (\texttt{--td\_lambda}, default 1.0) controls the relative strength of the TD signal on $\theta$. Setting $\lambda_{\text{TD}} < 1$ downweights the TD contribution to avoid overwhelming the language modeling gradient. The LM optimizer thus receives gradients from two sources each step: the LM loss (from the mixture or retrieved-example training) and the scaled TD loss.
+
+\paragraph{Cross-step graph avoidance.} A naive implementation would require keeping the full computation graph from step $k{-}1$ alive until step $k$, which is prohibitively expensive. Instead, we store the \emph{token IDs} of the previous action (not the hidden state), and re-forward them through the current $\theta_k$ at the next step. This costs one extra single-example transformer forward pass per step---negligible compared to the $N$-candidate or RAG forward passes---and avoids any cross-step graph retention.
+
+\paragraph{Relation to auxiliary tasks.} This is analogous to auxiliary-task representation learning in RL (Jaderberg et al., 2017; UNREAL): the TD loss acts as an auxiliary objective that encourages the base model to maintain representations useful for value prediction. Unlike standard auxiliary tasks, here the auxiliary signal is the Q-learning TD error itself, creating a closed loop between the value function and the representations it operates on.
+
+\paragraph{Note on the bootstrap target.} Only the Q-prediction side $Q_\phi(h_{\text{prev}})$ carries gradients into $\theta$. The bootstrap target $y = (1-\gamma)\,r + \gamma\,V_{\bar{\phi}}(s')$ remains stop-gradient with respect to both $\phi$ and $\theta$, as is standard in Q-learning. The target-network value $V_{\bar{\phi}}$ uses detached hidden states.
 
 \section{Langevin-RAG Curriculum Selection}\label{sec:langevinrag}
 
@@ -256,7 +284,8 @@ This produces a discrete token sequence $\mathbf{t} = (t_1, \ldots, t_L)$ that i
     \State \textcolor{gray}{\textit{// Stage 4: Q update (for previous transition, if $k > 0$)}}
     \State $H_k \gets \textsc{DetachedHidden}(\theta, \text{retrieved examples})$ \Comment{$[R, d]$}
     \State Compute $V_k$ from $Q_{\bar{\phi}}(H_k)$ as in Eq.~\eqref{eq:bellman}
-    \State Update $\phi$ to minimise $\frac{1}{2}(\hat{q}_{\text{prev}} - [(1-\gamma)\,r_{\text{prev}} + \gamma\,V_k])^2$
+    \State $h_{\text{prev}} \gets \textsc{Hidden}(\theta, a_{\text{prev}})$ \Comment{Detached by default; with-grad if \texttt{--td\_into\_theta}}
+    \State Update $\phi$ (and optionally $\theta$) to minimise $\frac{1}{2}(Q_\phi(h_{\text{prev}}) - [(1-\gamma)\,r_{\text{prev}} + \gamma\,V_k])^2$
     \State $\bar{\phi} \gets \tau\,\phi + (1-\tau)\,\bar{\phi}$
     \Statex
     \State \textcolor{gray}{\textit{// Stage 5: LM training (unweighted)}}

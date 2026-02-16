@@ -90,6 +90,17 @@ class AutodidactConfig:
     needle: bool = False              # Run needle-in-a-haystack Q-value validation
     needle_text: Optional[str] = None # Custom text for the needle sequence
 
+    # --- TD-into-theta: let TD gradients shape LM representations ---
+    td_into_theta: bool = False       # Allow TD loss gradients to flow into theta (LM weights)
+                                      # When enabled, the TD step re-forwards the previous action
+                                      # through the current theta with gradients, so the LM
+                                      # representations are shaped by both the LM loss and the
+                                      # Q-learning TD loss.
+    td_lambda: float = 1.0            # Scaling coefficient for TD gradients flowing into theta.
+                                      # The effective LM update from the TD step is:
+                                      #   theta -= lm_lr * td_lambda * d(TD_loss)/d(theta)
+                                      # Use < 1.0 to downweight the TD signal relative to LM loss.
+
     # --- Q-head warmup ---
     q_warmup_steps: int = 0           # Number of warmup steps with random sampling + theta reset
                                       # During warmup: random data (no SGLD), theta reset each step,

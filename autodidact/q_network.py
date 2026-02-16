@@ -4,8 +4,12 @@ Q-network for curriculum selection.
 Architecture (from Section 2.3 of the spec):
     Q_phi(s, x) = W2 * ReLU(W1 * h_x + b1) + b2
     
-    where h_x is the detached last-layer hidden state at the final token position
+    where h_x is the last-layer hidden state at the final token position
     from the base model, and phi = {W1, b1, W2, b2}.
+
+    By default, h_x is detached from theta (no gradients flow into the LM).
+    When --td_into_theta is enabled, extract_hidden_state_with_grad() is used
+    for the TD step so that value gradients also shape the LM representations.
 
     Dimensions: d -> 32 -> 1  (d = 768 for GPT-2)
 """
@@ -71,6 +75,27 @@ def extract_hidden_states(model, input_ids: torch.Tensor, batch_size: int = 32) 
             h = last_hidden[:, -1, :].detach()
             all_h.append(h)
     return torch.cat(all_h, dim=0)
+
+
+def extract_hidden_state_with_grad(model, input_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Forward a single example through the transformer WITH gradients into theta.
+
+    Unlike extract_hidden_states() (which detaches), this keeps the full
+    computation graph so that downstream losses (e.g. TD loss) can backprop
+    into the LM parameters.  Used by the --td_into_theta option.
+
+    Args:
+        model: HuggingFace GPT-2 LMHeadModel (we call model.transformer).
+        input_ids: [seq_len] or [1, seq_len] token IDs.
+
+    Returns:
+        h: [d] hidden state with grad_fn connected to theta.
+    """
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+    outputs = model.transformer(input_ids)
+    return outputs.last_hidden_state[:, -1, :].squeeze(0)  # [d]
 
 
 def compute_soft_value(q_values: torch.Tensor, beta: float) -> torch.Tensor:
