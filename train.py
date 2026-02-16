@@ -89,6 +89,8 @@ def parse_args() -> AutodidactConfig:
                         help="Mini-batch size for gradient-accumulated mixture training")
     parser.add_argument("--no_q_weighting", action="store_true",
                         help="Use uniform weights instead of Q-derived Boltzmann weights for LM mixture")
+    parser.add_argument("--reset_lm_each_step", action="store_true",
+                        help="Reset LM weights to initial theta after each step; only Q-network learns across steps")
 
     # Baselines
     parser.add_argument("--run_baselines", action="store_true")
@@ -231,6 +233,7 @@ def main():
             use_wandb=config.use_wandb,
             wandb_project=config.wandb_project,
             device=config.device,
+            reset_lm_each_step=config.reset_lm_each_step,
         )
         log_file = trainer.train(num_steps=config.num_steps)
         all_log_files.append(log_file)
@@ -266,6 +269,7 @@ def main():
         device=config.device,
         mixture_batch_size=config.mixture_batch_size,
         no_q_weighting=config.no_q_weighting,
+        reset_lm_each_step=config.reset_lm_each_step,
     )
     q_log = trainer.train(num_steps=config.num_steps)
     all_log_files.append(q_log)

@@ -132,6 +132,8 @@ class AutodidactTrainer:
         # Mixture training
         mixture_batch_size: int = 8,
         no_q_weighting: bool = False,
+        # Ablation: reset LM weights each step (only Q learns)
+        reset_lm_each_step: bool = False,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"Using device: {self.device}")
@@ -179,14 +181,20 @@ class AutodidactTrainer:
         self.mixture_batch_size = mixture_batch_size
         self.no_q_weighting = no_q_weighting
 
+        # --- Reset LM each step (ablation: only Q learns across steps) ---
+        self.reset_lm_each_step = reset_lm_each_step
+
         # --- Logging ---
         self.log_dir = log_dir
         self.use_wandb = use_wandb
         self.wandb_project = wandb_project
 
         # Store config dict for logger header
+        method_name = "q_learning_uniform_mixture" if no_q_weighting else "q_learning"
+        if reset_lm_each_step:
+            method_name += "_reset_lm"
         self._config_dict = {
-            "method_name": "q_learning_uniform_mixture" if no_q_weighting else "q_learning",
+            "method_name": method_name,
             "model_name": model_name,
             "dataset_name": dataset_name,
             "seq_len": seq_len,
@@ -204,6 +212,7 @@ class AutodidactTrainer:
             "grad_clip": grad_clip,
             "no_q_weighting": no_q_weighting,
             "mixture_batch_size": mixture_batch_size,
+            "reset_lm_each_step": reset_lm_each_step,
         }
 
         if use_wandb:
@@ -312,6 +321,25 @@ class AutodidactTrainer:
         for p, p_target in zip(self.q_net.parameters(), self.q_target.parameters()):
             p_target.data.mul_(1 - self.tau).add_(self.tau * p.data)
 
+    def _snapshot_lm(self):
+        """
+        Snapshot the current LM weights and optimizer state.
+        Called once at the start of training when reset_lm_each_step is enabled.
+        """
+        import copy
+        self._initial_lm_state = copy.deepcopy(self.model.state_dict())
+        self._initial_lm_optim_state = copy.deepcopy(self.lm_optimizer.state_dict())
+
+    def _reset_lm(self):
+        """
+        Reset LM weights and optimizer to the initial snapshot.
+        Called after each step's reward computation when reset_lm_each_step is enabled.
+        This ensures the LM always starts each step from theta_0, so only the
+        Q-network accumulates learning across steps.
+        """
+        self.model.load_state_dict(self._initial_lm_state)
+        self.lm_optimizer.load_state_dict(self._initial_lm_optim_state)
+
     def _save_checkpoint(self, checkpoint_dir, step: int):
         """
         Save model and Q-network weights to checkpoint_dir, overwriting any
@@ -341,8 +369,14 @@ class AutodidactTrainer:
         """
         from .data import StreamingTextDataset
 
+        # --- Snapshot LM weights if resetting each step ---
+        if self.reset_lm_each_step:
+            print("[reset_lm_each_step] Snapshotting initial LM weights (theta_0). "
+                  "LM will be reset after each step; only Q learns across steps.")
+            self._snapshot_lm()
+
         # --- Set up logging ---
-        method_label = "q_learning_uniform_mixture" if self.no_q_weighting else "q_learning"
+        method_label = self._config_dict["method_name"]
         logger = MetricsLogger(method_label, log_dir=self.log_dir, config=self._config_dict)
         run_dashboard = DashboardPlotter(output_path=str(logger.dashboard_file))
 
@@ -388,6 +422,10 @@ class AutodidactTrainer:
         D_hat = held_out.sample_subset(self.held_out_subset_size)
         r_prev = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
         cumulative_reward += r_prev
+
+        # Reset LM weights to theta_0 if ablation is active
+        if self.reset_lm_each_step:
+            self._reset_lm()
 
         # Log bootstrap
         V_0 = compute_soft_value(q_0, self.beta).item()
@@ -450,6 +488,10 @@ class AutodidactTrainer:
             r_k = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
             r_prev = r_k
             cumulative_reward += r_k
+
+            # Reset LM weights to theta_0 if ablation is active
+            if self.reset_lm_each_step:
+                self._reset_lm()
 
             step_time = time.time() - step_start
 
@@ -785,6 +827,8 @@ class LangevinRAGTrainer:
         wandb_project: str = "autodidact",
         # Device
         device: Optional[str] = None,
+        # Ablation: reset LM weights each step (only Q learns)
+        reset_lm_each_step: bool = False,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"[LangevinRAG] Using device: {self.device}")
@@ -835,6 +879,9 @@ class LangevinRAGTrainer:
         # --- LM micro-batch size ---
         self.lm_micro_batch_size = lm_micro_batch_size
 
+        # --- Reset LM each step (ablation: only Q learns across steps) ---
+        self.reset_lm_each_step = reset_lm_each_step
+
         # --- Langevin sampler ---
         self.langevin_sampler = LangevinQSampler(
             model=self.model,
@@ -872,8 +919,11 @@ class LangevinRAGTrainer:
         self._random_max_cos_snap = math.sqrt(2 * math.log(self._wte_vocab_size) / self._wte_hidden_dim)
 
         # Store config
+        method_name = "langevin_rag"
+        if reset_lm_each_step:
+            method_name += "_reset_lm"
         self._config_dict = {
-            "method_name": "langevin_rag",
+            "method_name": method_name,
             "model_name": model_name,
             "dataset_name": dataset_name,
             "seq_len": seq_len,
@@ -899,6 +949,7 @@ class LangevinRAGTrainer:
             "rag_embedding_model": rag_embedding_model,
             "rag_index_size": rag_index_size,
             "rag_top_k": rag_top_k,
+            "reset_lm_each_step": reset_lm_each_step,
             # Dimensionality info for dashboard reference lines
             "rag_embed_dim": self._rag_embed_dim,
             "wte_hidden_dim": self._wte_hidden_dim,
@@ -916,6 +967,25 @@ class LangevinRAGTrainer:
         """Soft-update target Q-network toward online Q-network."""
         for p, p_target in zip(self.q_net.parameters(), self.q_target.parameters()):
             p_target.data.mul_(1 - self.tau).add_(self.tau * p.data)
+
+    def _snapshot_lm(self):
+        """
+        Snapshot the current LM weights and optimizer state.
+        Called once at the start of training when reset_lm_each_step is enabled.
+        """
+        import copy
+        self._initial_lm_state = copy.deepcopy(self.model.state_dict())
+        self._initial_lm_optim_state = copy.deepcopy(self.lm_optimizer.state_dict())
+
+    def _reset_lm(self):
+        """
+        Reset LM weights and optimizer to the initial snapshot.
+        Called after each step's reward computation when reset_lm_each_step is enabled.
+        This ensures the LM always starts each step from theta_0, so only the
+        Q-network accumulates learning across steps.
+        """
+        self.model.load_state_dict(self._initial_lm_state)
+        self.lm_optimizer.load_state_dict(self._initial_lm_optim_state)
 
     def _q_step(
         self,
@@ -1024,8 +1094,14 @@ class LangevinRAGTrainer:
         Returns:
             Path to the JSONL log file.
         """
+        # --- Snapshot LM weights if resetting each step ---
+        if self.reset_lm_each_step:
+            print("[reset_lm_each_step] Snapshotting initial LM weights (theta_0). "
+                  "LM will be reset after each step; only Q learns across steps.")
+            self._snapshot_lm()
+
         # --- Set up logging ---
-        logger = MetricsLogger("langevin_rag", log_dir=self.log_dir, config=self._config_dict)
+        logger = MetricsLogger(self._config_dict["method_name"], log_dir=self.log_dir, config=self._config_dict)
         run_dashboard = LangevinRAGDashboard(output_path=str(logger.dashboard_file))
 
         # --- Build RAG index ---
@@ -1083,6 +1159,10 @@ class LangevinRAGTrainer:
         r_prev = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
         reward_time = time.time() - t_reward
         cumulative_reward += r_prev
+
+        # Reset LM weights to theta_0 if ablation is active
+        if self.reset_lm_each_step:
+            self._reset_lm()
 
         # Log best-Q sample text
         best_idx = langevin_info["best_q_sample_idx"]
@@ -1176,6 +1256,10 @@ class LangevinRAGTrainer:
             r_prev = r_k
             cumulative_reward += r_k
             reward_time = time.time() - t_reward
+
+            # Reset LM weights to theta_0 if ablation is active
+            if self.reset_lm_each_step:
+                self._reset_lm()
 
             step_time = time.time() - step_start
 
