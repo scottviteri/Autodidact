@@ -138,6 +138,10 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--rag_top_k", type=int, default=_defaults.rag_top_k,
                         help="Number of examples to retrieve per query")
 
+    # Q-head warmup
+    parser.add_argument("--q_warmup_steps", type=int, default=_defaults.q_warmup_steps,
+                        help="Number of warmup steps: random data + theta reset, only Q learns")
+
     args = parser.parse_args()
     return AutodidactConfig(**vars(args))
 
@@ -234,6 +238,7 @@ def main():
             wandb_project=config.wandb_project,
             device=config.device,
             reset_lm_each_step=config.reset_lm_each_step,
+            q_warmup_steps=config.q_warmup_steps,
         )
         log_file = trainer.train(num_steps=config.num_steps)
         all_log_files.append(log_file)

@@ -869,6 +869,8 @@ class LangevinRAGTrainer:
         device: Optional[str] = None,
         # Ablation: reset LM weights each step (only Q learns)
         reset_lm_each_step: bool = False,
+        # Q-head warmup
+        q_warmup_steps: int = 0,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"[LangevinRAG] Using device: {self.device}")
@@ -921,6 +923,9 @@ class LangevinRAGTrainer:
 
         # --- Reset LM each step (ablation: only Q learns across steps) ---
         self.reset_lm_each_step = reset_lm_each_step
+
+        # --- Q-head warmup ---
+        self.q_warmup_steps = q_warmup_steps
 
         # --- Langevin sampler ---
         self.langevin_sampler = LangevinQSampler(
@@ -990,6 +995,7 @@ class LangevinRAGTrainer:
             "rag_index_size": rag_index_size,
             "rag_top_k": rag_top_k,
             "reset_lm_each_step": reset_lm_each_step,
+            "q_warmup_steps": q_warmup_steps,
             # Dimensionality info for dashboard reference lines
             "rag_embed_dim": self._rag_embed_dim,
             "wte_hidden_dim": self._wte_hidden_dim,
@@ -1134,10 +1140,14 @@ class LangevinRAGTrainer:
         Returns:
             Path to the JSONL log file.
         """
-        # --- Snapshot LM weights if resetting each step ---
-        if self.reset_lm_each_step:
-            print("[reset_lm_each_step] Snapshotting initial LM weights (theta_0). "
-                  "LM will be reset after each step; only Q learns across steps.")
+        # --- Snapshot LM weights (needed for warmup theta resets and/or reset_lm_each_step) ---
+        if self.q_warmup_steps > 0 or self.reset_lm_each_step:
+            if self.reset_lm_each_step:
+                print("[reset_lm_each_step] Snapshotting initial LM weights (theta_0). "
+                      "LM will be reset after each step; only Q learns across steps.")
+            if self.q_warmup_steps > 0:
+                print(f"[Q-warmup] Snapshotting initial LM weights (theta_0) for "
+                      f"{self.q_warmup_steps} warmup steps.")
             self._snapshot_lm()
 
         # --- Set up logging ---
@@ -1175,6 +1185,145 @@ class LangevinRAGTrainer:
                 print(f"[LangevinRAG] Held-out[0]: {text[:200]}...")
 
         cumulative_reward = 0.0
+
+        # =====================================================================
+        # Q-head warmup phase (optional)
+        #
+        # Purpose: Let the Q-network learn the reward landscape before it is
+        # asked to guide expensive SGLD Langevin dynamics.
+        #
+        # Each warmup step:
+        #   1. Sample random training data from the RAG index (no SGLD).
+        #   2. Train the LM on the random data.
+        #   3. Compute reward on held-out data.
+        #   4. Update the Q-network via soft Bellman backup.
+        #   5. Reset theta back to initial weights (only Q accumulates).
+        #
+        # After warmup, the Q-network has a calibrated energy landscape and
+        # SGLD can immediately produce useful queries.
+        # =====================================================================
+        if self.q_warmup_steps > 0:
+            import random as _random
+
+            print(f"\n[Q-warmup] Starting {self.q_warmup_steps} warmup steps "
+                  f"(random data, theta reset each round, only Q learns)...")
+
+            # --- Warmup bootstrap (step w=0): no Q update ---
+            # Sample random examples from the RAG index
+            n_rag = self.rag_index.stored_token_ids.shape[0]
+            rag_top_k = self.rag_index.retrieval_top_k
+            rand_indices = _random.sample(range(n_rag), min(rag_top_k, n_rag))
+            warmup_ids = self.rag_index.stored_token_ids[rand_indices].to(self.device)
+
+            h_prev = extract_hidden_states(
+                self.model, warmup_ids[:1], batch_size=1
+            ).squeeze(0)
+
+            lm_loss, lm_grad_norm = self._lm_step_batch(warmup_ids)
+
+            D_hat = held_out.sample_subset(self.held_out_subset_size)
+            r_prev = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
+            cumulative_reward += r_prev
+
+            # Reset theta to initial weights (only Q keeps learning)
+            self._reset_lm()
+
+            # Evaluate Q on random hidden states for monitoring
+            with torch.no_grad():
+                q_warmup_val = self.q_net(h_prev.unsqueeze(0)).squeeze().item()
+
+            logger.log({
+                "step": 0,
+                "phase": "q_warmup",
+                "reward": r_prev,
+                "lm_loss": lm_loss,
+                "td_loss": 0.0,
+                "cumulative_reward": cumulative_reward,
+                "lm_grad_norm": lm_grad_norm,
+                "q_grad_norm": 0.0,
+                "q_warmup_q_val": q_warmup_val,
+                "step_time": 0.0,
+            })
+            print(f"  [Q-warmup bootstrap] lm_loss={lm_loss:.4f}, reward={r_prev:.4f}, "
+                  f"Q={q_warmup_val:.4f}")
+
+            # --- Warmup main loop (w = 1 .. q_warmup_steps) ---
+            for w in range(1, self.q_warmup_steps + 1):
+                warmup_start = time.time()
+
+                # 1. Sample random training data from RAG index
+                rand_indices = _random.sample(range(n_rag), min(rag_top_k, n_rag))
+                warmup_ids = self.rag_index.stored_token_ids[rand_indices].to(self.device)
+
+                # 2. Extract hidden states for Q-learning
+                H_warmup = extract_hidden_states(
+                    self.model, warmup_ids, batch_size=self.extract_batch_size
+                )
+                q_warmup = self.q_net(H_warmup)
+
+                # 3. Q update for previous transition
+                with torch.no_grad():
+                    q_warmup_target = self.q_target(H_warmup)
+                V_target = compute_soft_value(q_warmup_target, self.beta)
+                td_loss, q_grad_norm = self._q_step(h_prev, r_prev, V_target)
+
+                # Track h_prev for next step's Q update
+                h_prev = H_warmup[0].detach()
+
+                # 4. Train LM on random data
+                lm_loss, lm_grad_norm = self._lm_step_batch(warmup_ids)
+
+                # 5. Compute reward
+                D_hat = held_out.sample_subset(self.held_out_subset_size)
+                r_k = compute_held_out_reward(self.model, D_hat, eval_batch_size=self.eval_batch_size)
+                r_prev = r_k
+                cumulative_reward += r_k
+
+                # 6. Reset theta to initial weights (only Q keeps learning)
+                self._reset_lm()
+
+                warmup_time = time.time() - warmup_start
+
+                # Monitor Q-values
+                q_squeezed = q_warmup.squeeze(-1)
+                q_warmup_mean = q_squeezed.mean().item()
+                q_warmup_std = q_squeezed.std().item() if q_squeezed.numel() > 1 else 0.0
+
+                metrics = {
+                    "step": w,
+                    "phase": "q_warmup",
+                    "reward": r_k,
+                    "lm_loss": lm_loss,
+                    "td_loss": td_loss,
+                    "cumulative_reward": cumulative_reward,
+                    "lm_grad_norm": lm_grad_norm,
+                    "q_grad_norm": q_grad_norm,
+                    "q_warmup_q_mean": q_warmup_mean,
+                    "q_warmup_q_std": q_warmup_std,
+                    "soft_value": compute_soft_value(q_warmup, self.beta).item(),
+                    "step_time": warmup_time,
+                }
+                logger.log(metrics)
+
+                if w % self.log_interval == 0 or w == self.q_warmup_steps:
+                    print(
+                        f"  [Q-warmup] Step {w:4d}/{self.q_warmup_steps} | "
+                        f"reward={r_k:.4f} | td={td_loss:.6f} | "
+                        f"Q={q_warmup_mean:.4f}+/-{q_warmup_std:.4f} | "
+                        f"gnorm_q={q_grad_norm:.3f} | {warmup_time:.2f}s"
+                    )
+
+                if w % self.dashboard_interval == 0:
+                    try:
+                        run_dashboard.render([str(logger.log_file)])
+                    except Exception as e:
+                        print(f"  [Dashboard render error: {e}]")
+
+            print(f"\n[Q-warmup] Complete. Q-head trained for {self.q_warmup_steps} steps.")
+            print(f"[Q-warmup] Transitioning to full Langevin-RAG training...\n")
+
+            # Reset cumulative reward for the main training phase
+            cumulative_reward = 0.0
 
         # =====================================================================
         # Bootstrap step (k=0): no Q update

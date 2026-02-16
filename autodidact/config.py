@@ -90,6 +90,11 @@ class AutodidactConfig:
     needle: bool = False              # Run needle-in-a-haystack Q-value validation
     needle_text: Optional[str] = None # Custom text for the needle sequence
 
+    # --- Q-head warmup ---
+    q_warmup_steps: int = 0           # Number of warmup steps with random sampling + theta reset
+                                      # During warmup: random data (no SGLD), theta reset each step,
+                                      # only Q-network learns. Lets Q-head calibrate before guiding SGLD.
+
     # --- Langevin-RAG mode (default) ---
     langevin_rag: bool = True         # Use Langevin Q-guided search + RAG retrieval
     langevin_seq_len: int = 64        # Sequence length for Langevin embedding optimization
