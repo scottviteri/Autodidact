@@ -401,6 +401,16 @@ class AutodidactTrainer:
         # --- Topic similarity tracker ---
         topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
 
+        # --- Log held-out text(s) for reproducibility ---
+        for i, text in enumerate(held_out.texts):
+            logger.log({
+                "_type": "held_out",
+                "index": i,
+                "text": text[:2000],
+            })
+            if i == 0:
+                print(f"Held-out[0]: {text[:200]}...")
+
         cumulative_reward = 0.0
 
         # =====================================================================
@@ -1153,6 +1163,16 @@ class LangevinRAGTrainer:
 
         # --- Topic similarity tracker ---
         topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
+
+        # --- Log held-out text(s) for reproducibility ---
+        for i, text in enumerate(held_out.texts):
+            logger.log({
+                "_type": "held_out",
+                "index": i,
+                "text": text[:2000],
+            })
+            if i == 0:
+                print(f"[LangevinRAG] Held-out[0]: {text[:200]}...")
 
         cumulative_reward = 0.0
 
