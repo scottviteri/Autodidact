@@ -93,8 +93,10 @@ def parse_args() -> AutodidactConfig:
     # Mixture training
     parser.add_argument("--mixture_batch_size", type=int, default=_defaults.mixture_batch_size,
                         help="Mini-batch size for gradient-accumulated mixture training")
-    parser.add_argument("--no_q_weighting", action="store_true",
-                        help="Use uniform weights instead of Q-derived Boltzmann weights for LM mixture")
+    parser.add_argument("--no_q_weighting", action="store_true", default=True,
+                        help="Use uniform weights instead of Q-derived Boltzmann weights for LM loss (default)")
+    parser.add_argument("--q_weighting", dest="no_q_weighting", action="store_false",
+                        help="Weight LM loss by pi=softmax(Q/beta); applies to both discrete-Q and Langevin-RAG")
     parser.add_argument("--reset_lm_each_step", action="store_true",
                         help="Reset LM weights to initial theta after each step; only Q-network learns across steps")
 
@@ -261,6 +263,7 @@ def main():
             topic_coherent=config.topic_coherent,
             topic_pool_size=config.topic_pool_size,
             topic_temperature=config.topic_temperature,
+            no_q_weighting=config.no_q_weighting,
         )
         log_file = trainer.train(num_steps=config.num_steps)
         all_log_files.append(log_file)

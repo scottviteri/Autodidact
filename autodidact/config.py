@@ -83,7 +83,9 @@ class AutodidactConfig:
 
     # --- Mixture training ---
     mixture_batch_size: int = 8      # Mini-batch size for gradient-accumulated mixture training
-    no_q_weighting: bool = False     # Use uniform weights instead of Q-derived Boltzmann weights for LM mixture
+    no_q_weighting: bool = True      # Use uniform weights instead of Q-derived Boltzmann weights for LM loss
+                                     # Applies to both discrete-Q mode (mixture) and Langevin-RAG mode (retrieved batch).
+                                     # When False, weights are pi = softmax(Q/beta).
 
     # --- Ablation: reset LM each step ---
     reset_lm_each_step: bool = False  # Reset LM weights to initial theta after each step (only Q learns)

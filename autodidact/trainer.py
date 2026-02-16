@@ -881,8 +881,10 @@ class LangevinRAGTrainer:
         3. Embed the resulting "query sentences" with a sentence-transformer,
            search a pre-built FAISS index of the training dataset, and
            retrieve top-k real training examples.
-        4. Train the LM on the retrieved examples with uniform (unweighted)
-           loss — no Q-value weighting.
+        4. Train the LM on the retrieved examples. When no_q_weighting=True
+           (default), uses uniform loss. When no_q_weighting=False, weights
+           each example by pi = softmax(Q/beta), so examples the Q-network
+           considers more valuable receive a larger share of the gradient.
         5. Compute reward on held-out data and update the Q-network via the
            standard normalised discounted soft Bellman equation.
 
@@ -953,6 +955,8 @@ class LangevinRAGTrainer:
         topic_coherent: bool = False,
         topic_pool_size: int = 4096,
         topic_temperature: float = 0.1,
+        # Q-weighted LM training
+        no_q_weighting: bool = True,  # True = uniform (unweighted), False = softmax(Q/beta) weights
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"[LangevinRAG] Using device: {self.device}")
@@ -1018,6 +1022,12 @@ class LangevinRAGTrainer:
         if td_into_theta:
             print(f"[LangevinRAG td_into_theta] TD gradients will flow into theta (lambda={td_lambda}).")
 
+        # --- Q-weighted LM training ---
+        self.no_q_weighting = no_q_weighting
+        if not no_q_weighting:
+            print(f"[LangevinRAG] Q-weighted LM training enabled: "
+                  f"pi = softmax(Q/beta={beta}) weights on retrieved examples.")
+
         # --- Alternating training ---
         self.alternating_period = alternating_period
         if alternating_period > 0:
@@ -1062,6 +1072,8 @@ class LangevinRAGTrainer:
 
         # Store config
         method_name = "langevin_rag"
+        if not no_q_weighting:
+            method_name += "_q_weighted"
         if reset_lm_each_step:
             method_name += "_reset_lm"
         if td_into_theta:
@@ -1100,6 +1112,7 @@ class LangevinRAGTrainer:
             "td_into_theta": td_into_theta,
             "td_lambda": td_lambda,
             "alternating_period": alternating_period,
+            "no_q_weighting": no_q_weighting,
             "topic_coherent": topic_coherent,
             "topic_pool_size": topic_pool_size,
             "topic_temperature": topic_temperature,
@@ -1218,6 +1231,63 @@ class LangevinRAGTrainer:
         ).item()
         self.lm_optimizer.step()
         return total_loss / n_micro, grad_norm
+
+    def _lm_step_batch_weighted(
+        self,
+        batch_ids: torch.Tensor,
+        weights: torch.Tensor,
+        micro_batch_size: Optional[int] = None,
+    ) -> tuple:
+        """
+        Train LM on retrieved examples with Q-derived Boltzmann weights.
+
+        Each example's per-token cross-entropy is weighted by
+        pi_i = softmax(Q_i / beta), so examples the Q-network considers more
+        valuable receive a larger share of the gradient.
+
+        Uses gradient accumulation over micro-batches to control memory.
+
+        Args:
+            batch_ids: [B, seq_len] token IDs of retrieved examples.
+            weights: [B] Boltzmann policy weights (should sum to 1).
+            micro_batch_size: Number of examples per micro-batch forward pass.
+                              Defaults to self.lm_micro_batch_size.
+
+        Returns:
+            (weighted_loss_value, grad_norm)
+        """
+        if micro_batch_size is None:
+            micro_batch_size = self.lm_micro_batch_size
+        self.lm_optimizer.zero_grad()
+        B = batch_ids.shape[0]
+        weighted_loss_total = 0.0
+
+        for i in range(0, B, micro_batch_size):
+            micro = batch_ids[i : i + micro_batch_size]        # [bs, seq_len]
+            w = weights[i : i + micro_batch_size]               # [bs]
+
+            # Compute per-example losses from logits (HF mean-reduces across
+            # both tokens and the batch, so we recompute manually).
+            outputs = self.model(micro, labels=micro)
+            logits = outputs.logits[:, :-1, :].contiguous()     # [bs, seq_len-1, vocab]
+            labels = micro[:, 1:].contiguous()                  # [bs, seq_len-1]
+            per_token_loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                reduction='none',
+            ).view(labels.shape)                                # [bs, seq_len-1]
+            per_example_loss = per_token_loss.mean(dim=1)       # [bs]
+
+            # Weighted contribution of this mini-batch
+            mini_loss = (w * per_example_loss).sum()
+            mini_loss.backward()
+            weighted_loss_total += mini_loss.item()
+
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), self.grad_clip
+        ).item()
+        self.lm_optimizer.step()
+        return weighted_loss_total, grad_norm
 
     def _save_checkpoint(self, checkpoint_dir, step: int):
         """Save model and Q-network weights."""
@@ -1498,9 +1568,19 @@ class LangevinRAGTrainer:
         # Store token IDs for re-forward when td_into_theta is enabled
         prev_action_ids = retrieved_ids[0].clone() if self.td_into_theta else None
 
-        # LM training on retrieved examples (unweighted)
+        # LM training on retrieved examples
         t_lm = time.time()
-        lm_loss, lm_grad_norm = self._lm_step_batch(retrieved_ids)
+        if self.no_q_weighting:
+            lm_loss, lm_grad_norm = self._lm_step_batch(retrieved_ids)
+        else:
+            # Q-weighted bootstrap: Q is untrained so weights ≈ uniform, but consistent
+            H_boot = extract_hidden_states(
+                self.model, retrieved_ids, batch_size=self.extract_batch_size
+            )
+            q_boot = self.q_net(H_boot)  # [R, 1]
+            pi_boot = torch.softmax(q_boot.squeeze(-1) / self.beta, dim=0).detach()
+            lm_loss, lm_grad_norm = self._lm_step_batch_weighted(retrieved_ids, pi_boot)
+            del H_boot, q_boot, pi_boot
         lm_time = time.time() - t_lm
 
         # Reward
@@ -1615,9 +1695,15 @@ class LangevinRAGTrainer:
             if self.td_into_theta:
                 prev_action_ids = retrieved_ids[0].clone()
 
-            # --- 4. LM training on retrieved examples (unweighted) ---
+            # --- 4. LM training on retrieved examples ---
             t_lm = time.time()
-            lm_loss, lm_grad_norm = self._lm_step_batch(retrieved_ids)
+            if self.no_q_weighting:
+                # Uniform (unweighted) loss across all retrieved examples
+                lm_loss, lm_grad_norm = self._lm_step_batch(retrieved_ids)
+            else:
+                # Q-weighted: pi = softmax(Q / beta) over retrieved examples
+                pi = torch.softmax(q_retrieved.squeeze(-1) / self.beta, dim=0).detach()
+                lm_loss, lm_grad_norm = self._lm_step_batch_weighted(retrieved_ids, pi)
             lm_time = time.time() - t_lm
 
             # --- 5. Reward ---
