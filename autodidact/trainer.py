@@ -137,6 +137,10 @@ class AutodidactTrainer:
         # TD-into-theta: let TD gradients shape LM representations
         td_into_theta: bool = False,
         td_lambda: float = 1.0,
+        # Topic-coherent held-out set
+        topic_coherent: bool = False,
+        topic_pool_size: int = 4096,
+        topic_temperature: float = 0.1,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"Using device: {self.device}")
@@ -179,6 +183,9 @@ class AutodidactTrainer:
         # --- Data ---
         self.dataset_name = dataset_name
         self.held_out_total_size = held_out_total_size
+        self.topic_coherent = topic_coherent
+        self.topic_pool_size = topic_pool_size
+        self.topic_temperature = topic_temperature
 
         # --- Mixture training ---
         self.mixture_batch_size = mixture_batch_size
@@ -227,6 +234,9 @@ class AutodidactTrainer:
             "reset_lm_each_step": reset_lm_each_step,
             "td_into_theta": td_into_theta,
             "td_lambda": td_lambda,
+            "topic_coherent": topic_coherent,
+            "topic_pool_size": topic_pool_size,
+            "topic_temperature": topic_temperature,
         }
 
         if use_wandb:
@@ -437,12 +447,21 @@ class AutodidactTrainer:
             total_size=self.held_out_total_size,
             dataset_name=self.dataset_name,
             device=self.device,
+            topic_coherent=self.topic_coherent,
+            topic_pool_size=self.topic_pool_size,
+            topic_temperature=self.topic_temperature,
         )
 
         # --- Topic similarity tracker ---
         topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
 
         # --- Log held-out text(s) for reproducibility ---
+        if held_out.anchor_text is not None:
+            logger.log({
+                "_type": "topic_anchor",
+                "anchor_text": held_out.anchor_text[:2000],
+            })
+            print(f"Topic anchor: {held_out.anchor_text[:200]}...")
         for i, text in enumerate(held_out.texts):
             logger.log({
                 "_type": "held_out",
@@ -930,6 +949,10 @@ class LangevinRAGTrainer:
         td_lambda: float = 1.0,
         # Alternating training: cycle between reset-theta and regular mode
         alternating_period: int = 0,
+        # Topic-coherent held-out set
+        topic_coherent: bool = False,
+        topic_pool_size: int = 4096,
+        topic_temperature: float = 0.1,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"[LangevinRAG] Using device: {self.device}")
@@ -971,6 +994,9 @@ class LangevinRAGTrainer:
         # --- Data ---
         self.dataset_name = dataset_name
         self.held_out_total_size = held_out_total_size
+        self.topic_coherent = topic_coherent
+        self.topic_pool_size = topic_pool_size
+        self.topic_temperature = topic_temperature
 
         # --- Logging ---
         self.log_dir = log_dir
@@ -1074,6 +1100,9 @@ class LangevinRAGTrainer:
             "td_into_theta": td_into_theta,
             "td_lambda": td_lambda,
             "alternating_period": alternating_period,
+            "topic_coherent": topic_coherent,
+            "topic_pool_size": topic_pool_size,
+            "topic_temperature": topic_temperature,
             # Dimensionality info for dashboard reference lines
             "rag_embed_dim": self._rag_embed_dim,
             "wte_hidden_dim": self._wte_hidden_dim,
@@ -1272,12 +1301,21 @@ class LangevinRAGTrainer:
             total_size=self.held_out_total_size,
             dataset_name=self.dataset_name,
             device=self.device,
+            topic_coherent=self.topic_coherent,
+            topic_pool_size=self.topic_pool_size,
+            topic_temperature=self.topic_temperature,
         )
 
         # --- Topic similarity tracker ---
         topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
 
         # --- Log held-out text(s) for reproducibility ---
+        if held_out.anchor_text is not None:
+            logger.log({
+                "_type": "topic_anchor",
+                "anchor_text": held_out.anchor_text[:2000],
+            })
+            print(f"[LangevinRAG] Topic anchor: {held_out.anchor_text[:200]}...")
         for i, text in enumerate(held_out.texts):
             logger.log({
                 "_type": "held_out",

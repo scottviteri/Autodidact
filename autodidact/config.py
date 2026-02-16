@@ -45,6 +45,12 @@ class AutodidactConfig:
     held_out_subset_size: int = 256  # M: held-out subset size per step
     held_out_total_size: int = 2048  # |D|: total held-out set size
 
+    # --- Topic-coherent held-out set ---
+    topic_coherent: bool = False      # Sample held-out set around a random topic anchor
+    topic_pool_size: int = 4096       # Number of candidate windows to embed for topic selection
+    topic_temperature: float = 0.1    # Softmax temperature for topic-based sampling
+                                      # Low = tight topic cluster, high = diffuse (→ uniform)
+
     # --- Batching (GPU utilization) ---
     extract_batch_size: int = 64     # Mini-batch size for candidate hidden state extraction
     eval_batch_size: int = 64        # Mini-batch size for held-out reward computation

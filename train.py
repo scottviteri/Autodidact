@@ -53,6 +53,12 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--num_candidates", type=int, default=_defaults.num_candidates, help="N: candidates per step (discrete-Q mode)")
     parser.add_argument("--held_out_subset_size", type=int, default=_defaults.held_out_subset_size, help="M: held-out subset size")
     parser.add_argument("--held_out_total_size", type=int, default=_defaults.held_out_total_size, help="|D|: total held-out set")
+    parser.add_argument("--topic_coherent", action="store_true",
+                        help="Sample held-out set around a random topic anchor (sentence-embedding similarity)")
+    parser.add_argument("--topic_pool_size", type=int, default=_defaults.topic_pool_size,
+                        help="Number of candidate windows to embed when building topic-coherent held-out set")
+    parser.add_argument("--topic_temperature", type=float, default=_defaults.topic_temperature,
+                        help="Softmax temperature for topic-coherent sampling (low=tight cluster, high=diffuse)")
 
     # Batching
     parser.add_argument("--extract_batch_size", type=int, default=_defaults.extract_batch_size)
@@ -252,6 +258,9 @@ def main():
             td_into_theta=config.td_into_theta,
             td_lambda=config.td_lambda,
             alternating_period=config.alternating_period,
+            topic_coherent=config.topic_coherent,
+            topic_pool_size=config.topic_pool_size,
+            topic_temperature=config.topic_temperature,
         )
         log_file = trainer.train(num_steps=config.num_steps)
         all_log_files.append(log_file)
@@ -290,6 +299,9 @@ def main():
         reset_lm_each_step=config.reset_lm_each_step,
         td_into_theta=config.td_into_theta,
         td_lambda=config.td_lambda,
+        topic_coherent=config.topic_coherent,
+        topic_pool_size=config.topic_pool_size,
+        topic_temperature=config.topic_temperature,
     )
     q_log = trainer.train(num_steps=config.num_steps)
     all_log_files.append(q_log)
