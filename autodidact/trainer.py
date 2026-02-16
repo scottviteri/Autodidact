@@ -928,6 +928,8 @@ class LangevinRAGTrainer:
         # TD-into-theta: let TD gradients shape LM representations
         td_into_theta: bool = False,
         td_lambda: float = 1.0,
+        # Alternating training: cycle between reset-theta and regular mode
+        alternating_period: int = 0,
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"[LangevinRAG] Using device: {self.device}")
@@ -990,6 +992,12 @@ class LangevinRAGTrainer:
         if td_into_theta:
             print(f"[LangevinRAG td_into_theta] TD gradients will flow into theta (lambda={td_lambda}).")
 
+        # --- Alternating training ---
+        self.alternating_period = alternating_period
+        if alternating_period > 0:
+            print(f"[Alternating] Will cycle every {alternating_period} steps between "
+                  f"reset-theta mode and regular mode.")
+
         # --- Langevin sampler ---
         self.langevin_sampler = LangevinQSampler(
             model=self.model,
@@ -1032,6 +1040,8 @@ class LangevinRAGTrainer:
             method_name += "_reset_lm"
         if td_into_theta:
             method_name += "_td_into_theta"
+        if alternating_period > 0:
+            method_name += f"_alt{alternating_period}"
         self._config_dict = {
             "method_name": method_name,
             "model_name": model_name,
@@ -1063,6 +1073,7 @@ class LangevinRAGTrainer:
             "q_warmup_steps": q_warmup_steps,
             "td_into_theta": td_into_theta,
             "td_lambda": td_lambda,
+            "alternating_period": alternating_period,
             # Dimensionality info for dashboard reference lines
             "rag_embed_dim": self._rag_embed_dim,
             "wte_hidden_dim": self._wte_hidden_dim,
@@ -1227,14 +1238,19 @@ class LangevinRAGTrainer:
         Returns:
             Path to the JSONL log file.
         """
-        # --- Snapshot LM weights (needed for warmup theta resets and/or reset_lm_each_step) ---
-        if self.q_warmup_steps > 0 or self.reset_lm_each_step:
+        # --- Snapshot LM weights (needed for warmup, reset_lm_each_step, or alternating) ---
+        needs_snapshot = (self.q_warmup_steps > 0 or self.reset_lm_each_step
+                          or self.alternating_period > 0)
+        if needs_snapshot:
             if self.reset_lm_each_step:
                 print("[reset_lm_each_step] Snapshotting initial LM weights (theta_0). "
                       "LM will be reset after each step; only Q learns across steps.")
             if self.q_warmup_steps > 0:
                 print(f"[Q-warmup] Snapshotting initial LM weights (theta_0) for "
                       f"{self.q_warmup_steps} warmup steps.")
+            if self.alternating_period > 0:
+                print(f"[Alternating] Snapshotting initial LM weights (theta_0). "
+                      f"Will cycle reset/regular every {self.alternating_period} steps.")
             self._snapshot_lm()
 
         # --- Set up logging ---
@@ -1456,8 +1472,9 @@ class LangevinRAGTrainer:
         reward_time = time.time() - t_reward
         cumulative_reward += r_prev
 
-        # Reset LM weights to theta_0 if ablation is active
-        if self.reset_lm_each_step:
+        # Reset LM weights to theta_0 if ablation is active or in alternating reset phase
+        # (Bootstrap = step 0 is always in the first period, which is the reset phase)
+        if self.reset_lm_each_step or self.alternating_period > 0:
             self._reset_lm()
 
         # Log best-Q sample text
@@ -1507,9 +1524,20 @@ class LangevinRAGTrainer:
         # Main loop
         # =====================================================================
         print(f"\n[LangevinRAG] Starting main loop for {num_steps} steps...")
+        _prev_alternating_phase = None  # Track phase transitions for logging
 
         for k in range(1, num_steps + 1):
             step_start = time.time()
+
+            # --- Announce alternating phase transitions ---
+            if self.alternating_period > 0:
+                phase_idx = k // self.alternating_period
+                is_reset_phase = (phase_idx % 2 == 0)
+                if phase_idx != _prev_alternating_phase:
+                    _prev_alternating_phase = phase_idx
+                    mode_str = "RESET-THETA (only Q learns)" if is_reset_phase else "REGULAR (LM accumulates)"
+                    print(f"\n  === [Alternating] Phase {phase_idx}: {mode_str} "
+                          f"(steps {k}..{k + self.alternating_period - 1}) ===\n")
 
             # --- 1. Langevin dynamics -> query token IDs ---
             query_ids, langevin_info = self.langevin_sampler.sample()
@@ -1562,9 +1590,23 @@ class LangevinRAGTrainer:
             cumulative_reward += r_k
             reward_time = time.time() - t_reward
 
-            # Reset LM weights to theta_0 if ablation is active
+            # --- Determine whether to reset theta this step ---
+            # Alternating mode: cycle between reset-theta and regular every P steps.
+            #   Phase 0 (steps 0..P-1):   reset theta (only Q learns)
+            #   Phase 1 (steps P..2P-1):  regular (LM accumulates)
+            #   Phase 2 (steps 2P..3P-1): reset theta again, etc.
+            # reset_lm_each_step overrides: always reset.
             if self.reset_lm_each_step:
                 self._reset_lm()
+                resetting_this_step = True
+            elif self.alternating_period > 0:
+                # Which phase are we in? Even phases = reset, odd phases = regular.
+                phase_idx = k // self.alternating_period
+                resetting_this_step = (phase_idx % 2 == 0)
+                if resetting_this_step:
+                    self._reset_lm()
+            else:
+                resetting_this_step = False
 
             step_time = time.time() - step_start
 
@@ -1580,6 +1622,7 @@ class LangevinRAGTrainer:
             q_squeezed = q_retrieved.squeeze(-1)
             metrics = {
                 "step": global_step,
+                "resetting_theta": resetting_this_step,
                 "reward": r_k,
                 "lm_loss": lm_loss,
                 "td_loss": td_loss,
@@ -1652,8 +1695,13 @@ class LangevinRAGTrainer:
                 topic_msg = ""
                 if "best_q_topic_sim" in metrics:
                     topic_msg = f" | topic_sim={metrics['best_q_topic_sim']:.4f}"
+                mode_tag = ""
+                if resetting_this_step and self.alternating_period > 0:
+                    mode_tag = " [RST]"
+                elif self.alternating_period > 0:
+                    mode_tag = " [REG]"
                 print(
-                    f"[LangevinRAG] Step {global_step:6d} | reward={r_k:.4f} | "
+                    f"[LangevinRAG] Step {global_step:6d}{mode_tag} | reward={r_k:.4f} | "
                     f"lm_loss={lm_loss:.4f} | td={td_loss:.6f} | "
                     f"sgld_Q={langevin_info['q_final_mean']:.3f} "
                     f"(rand={langevin_info['q_random_mean']:.3f} "

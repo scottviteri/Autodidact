@@ -142,6 +142,10 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--q_warmup_steps", type=int, default=_defaults.q_warmup_steps,
                         help="Number of warmup steps: random data + theta reset, only Q learns")
 
+    # Alternating training
+    parser.add_argument("--alternating_period", type=int, default=_defaults.alternating_period,
+                        help="Alternate reset-theta / regular mode every N steps (0=disabled)")
+
     # TD-into-theta
     parser.add_argument("--td_into_theta", action="store_true",
                         help="Let TD loss gradients flow into theta (LM weights), shaping representations for Q-prediction")
@@ -247,6 +251,7 @@ def main():
             q_warmup_steps=config.q_warmup_steps,
             td_into_theta=config.td_into_theta,
             td_lambda=config.td_lambda,
+            alternating_period=config.alternating_period,
         )
         log_file = trainer.train(num_steps=config.num_steps)
         all_log_files.append(log_file)

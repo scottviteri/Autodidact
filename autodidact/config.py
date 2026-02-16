@@ -106,6 +106,14 @@ class AutodidactConfig:
                                       # During warmup: random data (no SGLD), theta reset each step,
                                       # only Q-network learns. Lets Q-head calibrate before guiding SGLD.
 
+    # --- Alternating training ---
+    alternating_period: int = 0       # If > 0, alternate between reset-theta mode and regular mode
+                                      # every alternating_period steps. E.g. 500 means:
+                                      #   steps 0-499:   reset theta each step (only Q learns)
+                                      #   steps 500-999: regular training (LM accumulates)
+                                      #   steps 1000-1499: reset theta again, etc.
+                                      # The Q-network always learns across all steps.
+
     # --- Langevin-RAG mode (default) ---
     langevin_rag: bool = True         # Use Langevin Q-guided search + RAG retrieval
     langevin_seq_len: int = 64        # Sequence length for Langevin embedding optimization
