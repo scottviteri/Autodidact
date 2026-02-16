@@ -1325,6 +1325,10 @@ class LangevinRAGTrainer:
             # Reset cumulative reward for the main training phase
             cumulative_reward = 0.0
 
+        # Step offset: main loop steps are numbered after warmup so the
+        # dashboard gets a continuous, monotonic x-axis.
+        step_offset = self.q_warmup_steps
+
         # =====================================================================
         # Bootstrap step (k=0): no Q update
         # =====================================================================
@@ -1371,7 +1375,7 @@ class LangevinRAGTrainer:
         best_q_text = self.tokenizer.decode(query_ids[best_idx].tolist())
 
         logger.log({
-            "step": 0,
+            "step": step_offset,
             "reward": r_prev,
             "lm_loss": lm_loss,
             "td_loss": 0.0,
@@ -1473,9 +1477,10 @@ class LangevinRAGTrainer:
                 gpu_mem_gb = 0.0
 
             # --- Metrics ---
+            global_step = step_offset + k
             q_squeezed = q_retrieved.squeeze(-1)
             metrics = {
-                "step": k,
+                "step": global_step,
                 "reward": r_k,
                 "lm_loss": lm_loss,
                 "td_loss": td_loss,
@@ -1547,7 +1552,7 @@ class LangevinRAGTrainer:
                 if "best_q_topic_sim" in metrics:
                     topic_msg = f" | topic_sim={metrics['best_q_topic_sim']:.4f}"
                 print(
-                    f"[LangevinRAG] Step {k:6d} | reward={r_k:.4f} | "
+                    f"[LangevinRAG] Step {global_step:6d} | reward={r_k:.4f} | "
                     f"lm_loss={lm_loss:.4f} | td={td_loss:.6f} | "
                     f"sgld_Q={langevin_info['q_final_mean']:.3f} "
                     f"(rand={langevin_info['q_random_mean']:.3f} "
@@ -1568,7 +1573,7 @@ class LangevinRAGTrainer:
                       f"sim={metrics.get('best_q_topic_sim', 0):.4f})]: {best_q_text[:200]}")
                 logger.log({
                     "_type": "best_sample",
-                    "step": k,
+                    "step": global_step,
                     "best_q_value": best_q_val,
                     "best_q_text": best_q_text[:500],
                     "best_q_topic_sim": metrics.get("best_q_topic_sim", 0.0),
@@ -1577,15 +1582,15 @@ class LangevinRAGTrainer:
 
             if k % self.eval_interval == 0:
                 eval_reward, eval_ppl = self._full_eval(held_out)
-                print(f"  [LangevinRAG EVAL] step={k} | reward={eval_reward:.4f} | ppl={eval_ppl:.2f}")
+                print(f"  [LangevinRAG EVAL] step={global_step} | reward={eval_reward:.4f} | ppl={eval_ppl:.2f}")
                 logger.log_eval({
-                    "step": k,
+                    "step": global_step,
                     "eval_reward": eval_reward,
                     "eval_perplexity": eval_ppl,
                 })
                 if self.use_wandb:
                     import wandb
-                    wandb.log({"eval_reward": eval_reward, "eval_perplexity": eval_ppl, "step": k})
+                    wandb.log({"eval_reward": eval_reward, "eval_perplexity": eval_ppl, "step": global_step})
 
             if k % self.dashboard_interval == 0:
                 try:
@@ -1594,10 +1599,10 @@ class LangevinRAGTrainer:
                     print(f"  [Dashboard render error: {e}]")
 
             if k % self.save_interval == 0:
-                self._save_checkpoint(str(logger.checkpoint_dir), k)
+                self._save_checkpoint(str(logger.checkpoint_dir), global_step)
 
         # Final saves
-        self._save_checkpoint(str(logger.checkpoint_dir), num_steps)
+        self._save_checkpoint(str(logger.checkpoint_dir), step_offset + num_steps)
         try:
             run_dashboard.render([str(logger.log_file)])
         except Exception as e:
