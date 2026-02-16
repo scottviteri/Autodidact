@@ -1,0 +1,98 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
+\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
+\global\let\oldcontentsline\contentsline
+\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
+\global\let\oldnewlabel\newlabel
+\gdef\newlabel#1#2{\newlabelxx{#1}#2}
+\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
+\AtEndDocument{\ifx\hyper@anchor\@undefined
+\let\contentsline\oldcontentsline
+\let\newlabel\oldnewlabel
+\fi}
+\fi}
+\global\let\hyper@last\relax 
+\gdef\HyperFirstAtBeginDocument#1{#1}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Overview}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Technical Approach}{1}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Setup}{1}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}State, Action, and Reward}{1}{subsection.2.2}\protected@file@percent }
+\newlabel{sec:sar}{{2.2}{1}{State, Action, and Reward}{subsection.2.2}{}}
+\newlabel{eq:reward}{{1}{2}{State, Action, and Reward}{equation.2.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Q-Network Architecture}{2}{subsection.2.3}\protected@file@percent }
+\newlabel{sec:qnet}{{2.3}{2}{Q-Network Architecture}{subsection.2.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Normalised Discounted Soft Bellman Equation}{2}{subsection.2.4}\protected@file@percent }
+\newlabel{sec:discount}{{2.4}{2}{Normalised Discounted Soft Bellman Equation}{subsection.2.4}{}}
+\newlabel{eq:bellman}{{3}{2}{Normalised Discounted Soft Bellman Equation}{equation.2.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Target network.}{3}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Algorithm}{3}{subsection.2.5}\protected@file@percent }
+\newlabel{sec:algorithm}{{2.5}{3}{Algorithm}{subsection.2.5}{}}
+\newlabel{eq:mixture_weights}{{6}{3}{Algorithm}{equation.2.6}{}}
+\newlabel{eq:mixture_loss}{{7}{3}{Algorithm}{equation.2.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Q-learning and the mixture LM update.}{4}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Off-policy interpretation.}{4}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Effective batch size.}{4}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Computational cost per step.}{4}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Staleness.}{4}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.6}Uniform Mixture Variant (No Q-Weighting)}{4}{subsection.2.6}\protected@file@percent }
+\newlabel{sec:noqweighting}{{2.6}{4}{Uniform Mixture Variant (No Q-Weighting)}{subsection.2.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.7}TD Gradients into Theta (Representation Shaping)}{5}{subsection.2.7}\protected@file@percent }
+\newlabel{sec:td_into_theta}{{2.7}{5}{TD Gradients into Theta (Representation Shaping)}{subsection.2.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Cross-step graph avoidance.}{5}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Relation to auxiliary tasks.}{5}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Note on the bootstrap target.}{5}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Gumbel-Softmax Langevin-RAG Curriculum Selection}{6}{section.3}\protected@file@percent }
+\newlabel{sec:langevinrag}{{3}{6}{Gumbel-Softmax Langevin-RAG Curriculum Selection}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Overview}{6}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}SGLD in Logit Space}{6}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:sgld}{{3.2}{6}{SGLD in Logit Space}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Optimisation variable.}{6}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Softmax bridge.}{6}{section*.11}\protected@file@percent }
+\newlabel{eq:softmax_bridge}{{11}{6}{Softmax bridge}{equation.3.11}{}}
+\@writefile{toc}{\contentsline {paragraph}{Energy function.}{7}{section*.12}\protected@file@percent }
+\newlabel{eq:energy}{{12}{7}{Energy function}{equation.3.12}{}}
+\@writefile{toc}{\contentsline {paragraph}{Langevin update.}{7}{section*.13}\protected@file@percent }
+\newlabel{eq:langevin}{{13}{7}{Langevin update}{equation.3.13}{}}
+\@writefile{toc}{\contentsline {paragraph}{Temperature annealing.}{7}{section*.14}\protected@file@percent }
+\newlabel{eq:tau_anneal}{{14}{7}{Temperature annealing}{equation.3.14}{}}
+\@writefile{toc}{\contentsline {paragraph}{Initialisation.}{7}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Gradient clipping.}{7}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Collection.}{7}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Token Extraction}{7}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:snap}{{3.3}{7}{Token Extraction}{subsection.3.3}{}}
+\newlabel{eq:snap}{{15}{7}{Token Extraction}{equation.3.15}{}}
+\@writefile{toc}{\contentsline {paragraph}{Sharpness diagnostic.}{8}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}RAG Retrieval}{8}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:rag}{{3.4}{8}{RAG Retrieval}{subsection.3.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Index construction (once, at startup).}{8}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Query and retrieval (each step).}{8}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Gumbel-Softmax Langevin-RAG Algorithm}{8}{subsection.3.5}\protected@file@percent }
+\newlabel{sec:langevin_algorithm}{{3.5}{8}{Gumbel-Softmax Langevin-RAG Algorithm}{subsection.3.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why logit-space SGLD avoids the snap bottleneck.}{8}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{LM training (uniform or Q-weighted).}{8}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Q-learning is off-policy.}{8}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Shared structure.}{8}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}SGLD Diagnostics}{9}{subsection.3.6}\protected@file@percent }
+\newlabel{sec:sgld_diagnostics}{{3.6}{9}{SGLD Diagnostics}{subsection.3.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.7}Interpretation as Free-Energy Minimisation}{9}{subsection.3.7}\protected@file@percent }
+\newlabel{sec:freeenergy}{{3.7}{9}{Interpretation as Free-Energy Minimisation}{subsection.3.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{ELBO interpretation.}{9}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Evaluation}{9}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Primary Metric: Sample Efficiency}{9}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Baselines}{10}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Analysis}{10}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Relation to Prior Work}{10}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Curriculum Learning}{10}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Meta-Learning}{10}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}RL as Inference}{10}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Soft Q-Learning}{11}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Intrinsic Motivation}{11}{subsection.5.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Connection to Prior Work}{11}{subsection.5.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Broader Motivation}{11}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Long-Term Direction: Formalizing Homeostasis}{12}{subsection.6.1}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Curriculum Selection via Normalised Discounted Soft Q-Learning}}{13}{algorithm.1}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {2}{\ignorespaces Curriculum Selection via Gumbel-Softmax Langevin-RAG}}{14}{algorithm.2}\protected@file@percent }
+\gdef \@abspage@last{14}

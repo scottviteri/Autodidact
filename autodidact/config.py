@@ -1,12 +1,14 @@
 """
 Hyperparameter configuration with dataclass defaults.
 
-Defaults are tuned for an H100 80GB GPU running the Langevin-RAG pipeline:
+Defaults are tuned for an H100 80GB GPU running the Gumbel-Softmax Langevin-RAG pipeline:
     - GPT-2 (124M params) uses ~0.5GB in fp32. Plenty of room.
     - seq_len=512: context windows for retrieved training examples.
-    - Langevin SGLD in embedding space generates query sentences, which are
+    - Gumbel-Softmax SGLD in logit space generates query sentences, which are
       used via RAG to retrieve real training data from a FAISS index.
-    - The LM trains on retrieved examples with uniform (unweighted) loss.
+    - The softmax bridge keeps inputs on the token manifold, avoiding the
+      snap bottleneck of the legacy embedding-space sampler.
+    - The LM trains on retrieved examples (uniform or Q-weighted loss).
     - AdamW for LM, Adam for Q-network.
 
 Q-learning formulation:
@@ -124,17 +126,21 @@ class AutodidactConfig:
 
     # --- Langevin-RAG mode (default) ---
     langevin_rag: bool = True         # Use Langevin Q-guided search + RAG retrieval
-    langevin_seq_len: int = 64        # Sequence length for Langevin embedding optimization
-    langevin_num_chains: int = 64      # K: parallel Langevin chains
-    langevin_num_samples: int = 64     # Total samples to collect from Langevin
-    langevin_steps: int = 50         # Total Langevin steps (burn-in + collection)
+    sampler_type: str = "gumbel"      # "gumbel" (Gumbel-Softmax, default) or "embedding" (legacy)
+    langevin_seq_len: int = 64        # Sequence length for Langevin optimization
+    langevin_num_chains: int = 64     # K: parallel Langevin chains
+    langevin_num_samples: int = 64    # Total samples to collect from Langevin
+    langevin_steps: int = 50          # Total Langevin steps (burn-in + collection)
     langevin_burn_in: int = 40        # Discard first N steps
-    langevin_thin: int = 10            # Keep every N-th sample after burn-in
+    langevin_thin: int = 10           # Keep every N-th sample after burn-in
     langevin_step_size: float = 0.01  # Langevin step size epsilon
-    langevin_temperature: float = 1.0 # Sampling temperature (scales energy)
+    langevin_temperature: float = 1.0 # SGLD energy temperature (scales Q in energy)
     langevin_noise_scale: float = 1.0 # Multiplier on Gaussian noise term
-    langevin_grad_clip: float = 1.0   # Clip embedding gradients per chain
+    langevin_grad_clip: float = 1.0   # Clip gradients per chain
     langevin_batch_size: int = 64     # Chains to process in parallel in _energy()
+    # Gumbel-Softmax temperature annealing (only used when sampler_type="gumbel")
+    gumbel_tau_start: float = 2.0     # Softmax temperature at step 0 (high = soft/exploratory)
+    gumbel_tau_end: float = 0.5       # Softmax temperature at final step (low = sharp/peaked)
     lm_micro_batch_size: int = 64     # Micro-batch size for gradient-accumulated LM training
     rag_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     rag_index_size: int = 50000       # Number of dataset windows to index

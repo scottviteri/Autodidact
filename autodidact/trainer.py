@@ -31,7 +31,7 @@ from .q_network import QNetwork, extract_hidden_states, extract_hidden_state_wit
 from .data import CandidateBatchSampler, HeldOutSet, TopicSimilarityTracker
 from .baselines import BaselineSelector
 from .logging import MetricsLogger, DashboardPlotter, LangevinRAGDashboard
-from .langevin_rag import LangevinQSampler, RAGIndex
+from .langevin_rag import GumbelSoftmaxQSampler, LangevinQSampler, RAGIndex
 
 
 def compute_lm_loss(model: GPT2LMHeadModel, input_ids: torch.Tensor) -> torch.Tensor:
@@ -926,6 +926,11 @@ class LangevinRAGTrainer:
         langevin_noise_scale: float = 1.0,
         langevin_grad_clip: float = 1.0,
         langevin_batch_size: int = 4,
+        # Gumbel-Softmax temperature annealing
+        gumbel_tau_start: float = 2.0,
+        gumbel_tau_end: float = 0.5,
+        # Sampler selection: "gumbel" (default) or "embedding" (legacy)
+        sampler_type: str = "gumbel",
         # LM training micro-batching
         lm_micro_batch_size: int = 4,
         # RAG
@@ -1035,7 +1040,8 @@ class LangevinRAGTrainer:
                   f"reset-theta mode and regular mode.")
 
         # --- Langevin sampler ---
-        self.langevin_sampler = LangevinQSampler(
+        self.sampler_type = sampler_type
+        sampler_kwargs = dict(
             model=self.model,
             q_net=self.q_net,
             seq_len=langevin_seq_len,
@@ -1049,8 +1055,17 @@ class LangevinRAGTrainer:
             noise_scale=langevin_noise_scale,
             grad_clip=langevin_grad_clip,
             langevin_batch_size=langevin_batch_size,
+            gumbel_tau_start=gumbel_tau_start,
+            gumbel_tau_end=gumbel_tau_end,
             device=self.device,
         )
+        if sampler_type == "gumbel":
+            print(f"[LangevinRAG] Using Gumbel-Softmax sampler "
+                  f"(tau: {gumbel_tau_start} -> {gumbel_tau_end})")
+            self.langevin_sampler = GumbelSoftmaxQSampler(**sampler_kwargs)
+        else:
+            print(f"[LangevinRAG] Using legacy embedding-space sampler")
+            self.langevin_sampler = LangevinQSampler(**sampler_kwargs)
 
         # --- RAG index ---
         self.rag_index = RAGIndex(
@@ -1103,6 +1118,9 @@ class LangevinRAGTrainer:
             "langevin_step_size": langevin_step_size,
             "langevin_temperature": langevin_temperature,
             "langevin_batch_size": langevin_batch_size,
+            "gumbel_tau_start": gumbel_tau_start,
+            "gumbel_tau_end": gumbel_tau_end,
+            "sampler_type": sampler_type,
             "lm_micro_batch_size": lm_micro_batch_size,
             "rag_embedding_model": rag_embedding_model,
             "rag_index_size": rag_index_size,
@@ -1623,6 +1641,10 @@ class LangevinRAGTrainer:
             "sgld_snap_cosine_mean": langevin_info["snap_cosine_mean"],
             "sgld_embed_cosine_mean": langevin_info["embed_pairwise_cosine_mean"],
             "sgld_token_jaccard_mean": langevin_info["token_jaccard_mean"],
+            # Gumbel-Softmax sharpness (0 for legacy sampler)
+            "sgld_softmax_entropy": langevin_info.get("softmax_entropy_mean", 0.0),
+            "sgld_softmax_max_prob": langevin_info.get("softmax_max_prob_mean", 0.0),
+            "sgld_final_tau": langevin_info.get("final_tau", 0.0),
             # SGLD gradient health
             "sgld_grad_norm_mean": langevin_info["grad_norm_mean"],
             "sgld_grad_clip_frac": langevin_info["grad_clip_frac"],
@@ -1773,6 +1795,10 @@ class LangevinRAGTrainer:
                 "sgld_snap_cosine_mean": langevin_info["snap_cosine_mean"],
                 "sgld_embed_cosine_mean": langevin_info["embed_pairwise_cosine_mean"],
                 "sgld_token_jaccard_mean": langevin_info["token_jaccard_mean"],
+                # Gumbel-Softmax sharpness (0 for legacy sampler)
+                "sgld_softmax_entropy": langevin_info.get("softmax_entropy_mean", 0.0),
+                "sgld_softmax_max_prob": langevin_info.get("softmax_max_prob_mean", 0.0),
+                "sgld_final_tau": langevin_info.get("final_tau", 0.0),
                 # SGLD gradient health
                 "sgld_grad_norm_mean": langevin_info["grad_norm_mean"],
                 "sgld_grad_clip_frac": langevin_info["grad_clip_frac"],

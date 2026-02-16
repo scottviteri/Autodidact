@@ -137,6 +137,13 @@ def parse_args() -> AutodidactConfig:
                         help="Clip embedding gradients per chain")
     parser.add_argument("--langevin_batch_size", type=int, default=_defaults.langevin_batch_size,
                         help="Chains to process in parallel during Langevin energy computation")
+    parser.add_argument("--gumbel_tau_start", type=float, default=_defaults.gumbel_tau_start,
+                        help="Gumbel-Softmax temperature at start of SGLD (high = soft/exploratory)")
+    parser.add_argument("--gumbel_tau_end", type=float, default=_defaults.gumbel_tau_end,
+                        help="Gumbel-Softmax temperature at end of SGLD (low = sharp/peaked)")
+    parser.add_argument("--sampler_type", type=str, default=_defaults.sampler_type,
+                        choices=["gumbel", "embedding"],
+                        help="SGLD sampler: 'gumbel' (Gumbel-Softmax in logit space, default) or 'embedding' (legacy)")
     parser.add_argument("--lm_micro_batch_size", type=int, default=_defaults.lm_micro_batch_size,
                         help="Micro-batch size for gradient-accumulated LM training on retrieved examples")
     parser.add_argument("--rag_embedding_model", type=str, default=_defaults.rag_embedding_model,
@@ -243,6 +250,9 @@ def main():
             langevin_noise_scale=config.langevin_noise_scale,
             langevin_grad_clip=config.langevin_grad_clip,
             langevin_batch_size=config.langevin_batch_size,
+            gumbel_tau_start=config.gumbel_tau_start,
+            gumbel_tau_end=config.gumbel_tau_end,
+            sampler_type=config.sampler_type,
             lm_micro_batch_size=config.lm_micro_batch_size,
             rag_embedding_model=config.rag_embedding_model,
             rag_index_size=config.rag_index_size,

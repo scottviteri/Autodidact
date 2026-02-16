@@ -204,78 +204,98 @@ The coefficient $\lambda_{\text{TD}}$ (\texttt{--td\_lambda}, default 1.0) contr
 
 \paragraph{Note on the bootstrap target.} Only the Q-prediction side $Q_\phi(h_{\text{prev}})$ carries gradients into $\theta$. The bootstrap target $y = (1-\gamma)\,r + \gamma\,V_{\bar{\phi}}(s')$ remains stop-gradient with respect to both $\phi$ and $\theta$, as is standard in Q-learning. The target-network value $V_{\bar{\phi}}$ uses detached hidden states.
 
-\section{Langevin-RAG Curriculum Selection}\label{sec:langevinrag}
+\section{Gumbel-Softmax Langevin-RAG Curriculum Selection}\label{sec:langevinrag}
 
-The discrete-Q approach (Section~\ref{sec:algorithm}) scores a fixed batch of $N$ candidates per step. This limits the search to the $N$ examples that happen to appear in the current batch---a tiny fraction of the training corpus. To search over a much larger space of possible training data, we introduce a two-stage pipeline that uses the Q-network as an energy function for continuous optimisation via Stochastic Gradient Langevin Dynamics (SGLD), then retrieves real training examples from a large indexed corpus via Retrieval-Augmented Generation (RAG).
+The discrete-Q approach (Section~\ref{sec:algorithm}) scores a fixed batch of $N$ candidates per step. This limits the search to the $N$ examples that happen to appear in the current batch---a tiny fraction of the training corpus. To search over a much larger space of possible training data, we introduce a pipeline that uses the Q-network as an energy function for continuous optimisation via Stochastic Gradient Langevin Dynamics (SGLD), then retrieves real training examples from a large indexed corpus via Retrieval-Augmented Generation (RAG).
+
+A na\"ive approach would run SGLD directly in the model's embedding space $\mathbb{R}^d$, then snap the resulting continuous vectors to discrete tokens via nearest-neighbor lookup. However, this suffers from a \emph{snap bottleneck}: Langevin dynamics pushes embeddings off the token manifold into regions of $\mathbb{R}^d$ that are far from any real token, so nearest-neighbor snapping destroys the information that SGLD optimised. Our solution is to run SGLD in \emph{logit space} over the vocabulary, using a softmax bridge to keep the transformer's input always in the convex hull of real token embeddings.
 
 \subsection{Overview}
 
 The pipeline proceeds in four stages per training step:
 \begin{enumerate}[nosep]
-    \item \textbf{Langevin sampling in embedding space} (Section~\ref{sec:sgld}): Initialise $K$ parallel chains of continuous embeddings and run SGLD using the Q-network as an energy function. After burn-in, collect samples that represent ``what the Q-network wants to train on.''
-    \item \textbf{Snap to tokens} (Section~\ref{sec:snap}): Map each continuous embedding sample to a discrete token sequence via nearest-neighbor lookup against the model's token embedding matrix.
-    \item \textbf{RAG retrieval} (Section~\ref{sec:rag}): Embed the discrete query sentences with a sentence-transformer model and retrieve the top-$k$ most similar real training examples from a pre-built FAISS index of the corpus.
-    \item \textbf{Unweighted LM training}: Train the language model on the retrieved examples with uniform loss (no Q-weighting), since the curriculum signal is already embedded in which examples were retrieved.
+    \item \textbf{Gumbel-Softmax SGLD in logit space} (Section~\ref{sec:sgld}): Maintain $K$ parallel chains, each a tensor of logits $\boldsymbol{\lambda} \in \mathbb{R}^{L \times V}$ over the vocabulary at every token position. At each Langevin step, form soft token embeddings via $\text{softmax}(\boldsymbol{\lambda}/\tau_t) \cdot W_e$, feed through the transformer and Q-network, backpropagate $\partial Q / \partial \boldsymbol{\lambda}$, and apply the Langevin update. After burn-in, collect samples.
+    \item \textbf{Token extraction} (Section~\ref{sec:snap}): Extract discrete tokens via $\arg\max$ of the logits---no lossy nearest-neighbor snap.
+    \item \textbf{RAG retrieval} (Section~\ref{sec:rag}): Embed the query sentences with a sentence-transformer and retrieve top-$k$ real training examples from a FAISS index.
+    \item \textbf{LM training}: Train the language model on the retrieved examples (uniform or Q-weighted loss).
 \end{enumerate}
 
-The key insight is that the Q-network encodes a preference over text via the base model's representations: $Q_\phi(\text{transformer}(x))$ assigns a scalar value to any input. By treating $Q$ as an energy function and sampling in the continuous embedding space, we can search over an effectively infinite space of ``virtual'' inputs, unconstrained by which examples happen to be in the current batch.
+The key insight is that the softmax constraint $\text{softmax}(\boldsymbol{\lambda}/\tau) \cdot W_e$ keeps the transformer's input in the \emph{convex hull} of real token embeddings at all times. As SGLD progresses and the softmax sharpens, each position's distribution concentrates around a specific token---the one that maximises the Q-value in context. The $\arg\max$ at the end simply reads off which token dominates, rather than performing a lossy projection.
 
-\subsection{SGLD in Embedding Space}\label{sec:sgld}
+\subsection{SGLD in Logit Space}\label{sec:sgld}
 
-Let $\mathbf{e} \in \mathbb{R}^{L \times d}$ be a continuous embedding sequence of length $L$ in the GPT-2 embedding space ($d = 768$). Define the energy function:
+\paragraph{Optimisation variable.} Let $\boldsymbol{\lambda} \in \mathbb{R}^{L \times V}$ be a matrix of unconstrained logits, where $L$ is the query sequence length and $V$ is the vocabulary size. Each row $\boldsymbol{\lambda}_i \in \mathbb{R}^V$ parameterises a categorical distribution over tokens at position $i$.
+
+\paragraph{Softmax bridge.} Given a softmax temperature $\tau_t > 0$, the soft token probabilities and soft embeddings are:
+\begin{equation}\label{eq:softmax_bridge}
+    \boldsymbol{\pi}_i = \text{softmax}(\boldsymbol{\lambda}_i / \tau_t), \qquad
+    \tilde{\mathbf{e}}_i = \sum_{v=1}^{V} \pi_{i,v}\, W_e[v] = \boldsymbol{\pi}_i^\top W_e,
+\end{equation}
+where $W_e \in \mathbb{R}^{V \times d}$ is the frozen token embedding matrix. The soft embedding $\tilde{\mathbf{e}}_i$ is a convex combination of real token embeddings, weighted by the softmax probabilities. When $\tau_t$ is large, $\boldsymbol{\pi}_i$ is diffuse and $\tilde{\mathbf{e}}_i$ is a broad average; when $\tau_t$ is small, $\boldsymbol{\pi}_i$ concentrates on one token and $\tilde{\mathbf{e}}_i \approx W_e[v^*]$ for the dominant token $v^*$.
+
+\paragraph{Energy function.} The energy is defined on the logits via the softmax bridge:
 \begin{equation}\label{eq:energy}
-    E(\mathbf{e}) = \frac{1}{\tau}\, Q_\phi\bigl(\text{transformer}(\mathbf{e})\bigr),
+    E(\boldsymbol{\lambda};\, \tau_t) = \frac{1}{\tau_{\text{sgld}}}\, Q_\phi\!\left(\text{transformer}\!\left(\tilde{\mathbf{e}}(\boldsymbol{\lambda}, \tau_t)\right)\right),
 \end{equation}
-where $\text{transformer}(\mathbf{e})$ feeds $\mathbf{e}$ as \texttt{inputs\_embeds} (bypassing the token embedding lookup), extracts the last-layer hidden state at the final position, and passes it through the Q-network $Q_\phi$. The temperature $\tau > 0$ controls how peaked the resulting distribution is around high-$Q$ regions.
+where $\text{transformer}(\tilde{\mathbf{e}})$ feeds the soft embeddings as \texttt{inputs\_embeds}, extracts the last-layer hidden state at the final position, and passes it through the Q-network. The SGLD temperature $\tau_{\text{sgld}}$ controls how peaked the Boltzmann distribution $p(\boldsymbol{\lambda}) \propto \exp(E(\boldsymbol{\lambda}))$ is.
 
-We seek samples from $p(\mathbf{e}) \propto \exp(E(\mathbf{e}))$---the Boltzmann distribution that concentrates on embeddings with high Q-values. SGLD produces approximate samples via the Langevin update:
+\paragraph{Langevin update.} SGLD produces approximate samples via:
 \begin{equation}\label{eq:langevin}
-    \mathbf{e}_{t+1} = \mathbf{e}_t + \frac{\varepsilon}{2}\, \nabla_{\mathbf{e}} E(\mathbf{e}_t) + \sqrt{\varepsilon}\;\boldsymbol{\eta}_t, \qquad \boldsymbol{\eta}_t \sim \mathcal{N}(0, \sigma^2 I),
+    \boldsymbol{\lambda}_{t+1} = \boldsymbol{\lambda}_t + \frac{\varepsilon}{2}\, \nabla_{\boldsymbol{\lambda}} E(\boldsymbol{\lambda}_t;\, \tau_t) + \sqrt{\varepsilon}\;\boldsymbol{\eta}_t, \qquad \boldsymbol{\eta}_t \sim \mathcal{N}(0, \sigma^2 I),
 \end{equation}
-where $\varepsilon$ is the step size and $\sigma$ controls the noise scale. The gradient $\nabla_{\mathbf{e}} E$ is computed by backpropagating from the Q-value through the full transformer into the input embeddings. Gradient checkpointing is used to keep memory bounded during this backward pass.
+where $\varepsilon$ is the step size and $\sigma$ the noise scale. The gradient $\nabla_{\boldsymbol{\lambda}} E$ is computed by backpropagating from the Q-value through the Q-network, the transformer, the softmax bridge, and into the logits. Gradient checkpointing is used for the transformer blocks to keep memory bounded.
 
-\paragraph{Initialisation.} Each of the $K$ chains is initialised by sampling random token IDs uniformly from the vocabulary and looking up their embeddings via the model's $\mathtt{wte}$ matrix. This places the initial points in a realistic region of embedding space.
+\paragraph{Temperature annealing.} The softmax temperature $\tau_t$ is annealed linearly from $\tau_{\text{start}}$ (high, exploratory) to $\tau_{\text{end}}$ (low, sharp) over the Langevin steps:
+\begin{equation}\label{eq:tau_anneal}
+    \tau_t = \tau_{\text{start}} + \frac{t}{T_{\max} - 1}\,(\tau_{\text{end}} - \tau_{\text{start}}).
+\end{equation}
+This creates a natural coarse-to-fine search: early steps explore broadly (high $\tau$, soft distributions), while later steps refine toward specific tokens (low $\tau$, peaked distributions). The annealing schedule is analogous to simulated annealing, but applied to the softmax bridge rather than the SGLD noise.
 
-\paragraph{Gradient clipping.} Per-chain gradient norms are clipped to a threshold $G_{\text{embed}}$ to prevent instability from large gradients in early Langevin steps.
+\paragraph{Initialisation.} Each chain's logits are initialised as approximate one-hots: for each position, a random token is chosen uniformly from the vocabulary and assigned a high logit value (e.g.\ 10), with all other logits at 0. This ensures the initial soft embeddings are very close to real token embeddings, starting SGLD on the token manifold.
 
-\paragraph{Collection.} The first $B$ steps are discarded as burn-in. After burn-in, every $T$-th sample is collected (thinning) to reduce autocorrelation. Collection stops once the desired number of samples $S$ has been gathered. With $K$ parallel chains, this requires $\lceil S / K \rceil$ collection events.
+\paragraph{Gradient clipping.} Per-chain gradient norms (flattened across all $L \times V$ logit entries) are clipped to a threshold $G$ for stability.
 
-\subsection{Snap to Tokens}\label{sec:snap}
+\paragraph{Collection.} The first $B$ steps are discarded as burn-in. After burn-in, every $T$-th sample is collected (thinning). Collection stops once $S$ samples have been gathered.
 
-Each collected embedding sample $\mathbf{e} \in \mathbb{R}^{L \times d}$ is a continuous vector that does not correspond to any real token sequence. We map it to discrete tokens via nearest-neighbor cosine similarity against the model's token embedding matrix $W_e \in \mathbb{R}^{V \times d}$:
+\subsection{Token Extraction}\label{sec:snap}
+
+After SGLD, discrete tokens are extracted via argmax of the collected logits:
 \begin{equation}\label{eq:snap}
-    t_i = \arg\max_{v \in \{1, \ldots, V\}} \frac{\mathbf{e}_i \cdot W_e[v]}{\|\mathbf{e}_i\| \, \|W_e[v]\|}, \qquad i = 1, \ldots, L.
+    t_i = \arg\max_{v \in \{1, \ldots, V\}} \lambda_{i,v}, \qquad i = 1, \ldots, L.
 \end{equation}
-This produces a discrete token sequence $\mathbf{t} = (t_1, \ldots, t_L)$ that is typically incoherent natural language---a bag of loosely related tokens---since the Langevin dynamics optimises for Q-value rather than fluency. However, this sequence serves only as a \emph{query} for RAG retrieval, not as training data itself; the sentence-transformer embedding (Section~\ref{sec:rag}) is robust to such noise.
+Unlike the legacy approach (nearest-neighbor cosine similarity in $\mathbb{R}^d$), this is \emph{exact}: the argmax token \emph{is} the dominant mode of the softmax distribution that SGLD optimised. No information is lost in the continuous-to-discrete conversion, because the optimisation variable (logits) directly parameterises the discrete choice.
+
+\paragraph{Sharpness diagnostic.} The quality of token extraction is measured by the \emph{softmax entropy} $H = -\sum_v \pi_v \log \pi_v$ and the \emph{max probability} $\max_v \pi_v$ at the final softmax temperature. Low entropy / high max-probability indicates that the SGLD has converged to well-defined token choices. For reference, a uniform distribution over $V = 50{,}257$ tokens has entropy $\log V \approx 10.8$; a perfectly sharp distribution has entropy $0$ and max-probability $1$.
 
 \subsection{RAG Retrieval}\label{sec:rag}
 
 \paragraph{Index construction (once, at startup).} We stream through the training corpus and extract $I$ fixed-length token windows. Each window is decoded to text and embedded with a pretrained sentence-transformer model (all-MiniLM-L6-v2, $d_{\text{st}} = 384$), producing normalised embedding vectors. These are stored in a FAISS inner-product index for efficient nearest-neighbor search.
 
-\paragraph{Query and retrieval (each step).} The $S$ discrete query sequences from the snap step are decoded to text and embedded with the same sentence-transformer. For each query, the top-$k$ nearest neighbours in the FAISS index are retrieved by cosine similarity. Results are deduplicated across all queries to produce $R \leq S \cdot k$ unique training examples.
+\paragraph{Query and retrieval (each step).} The $S$ discrete query sequences from the token extraction step are decoded to text and embedded with the same sentence-transformer. For each query, the top-$k$ nearest neighbours in the FAISS index are retrieved by cosine similarity. Results are deduplicated across all queries to produce $R \leq S \cdot k$ unique training examples.
 
-\paragraph{Why RAG works despite gibberish queries.} The sentence-transformer maps the incoherent token sequence to a dense vector that captures its topical content---the model is trained to be robust to paraphrasing and noise. Empirically, the cosine similarity between query embeddings and retrieved documents is $\sim\!0.44$ (moderate similarity), indicating that the retrieval is coarse enough to tolerate the snap artifacts while still being meaningfully directed by the Q-network's preferences.
-
-\subsection{Langevin-RAG Algorithm}\label{sec:langevin_algorithm}
+\subsection{Gumbel-Softmax Langevin-RAG Algorithm}\label{sec:langevin_algorithm}
 
 \begin{algorithm}[h]
-\caption{Curriculum Selection via Langevin-RAG}
+\caption{Curriculum Selection via Gumbel-Softmax Langevin-RAG}
 \begin{algorithmic}[1]
 \State \textbf{Initialise:} LM parameters $\theta$; Q-network $\phi$; target $\bar{\phi} \gets \phi$; FAISS index over $I$ corpus windows
 \Statex
 \For{$k = 0, 1, 2, \ldots$}
     \Statex
-    \State \textcolor{gray}{\textit{// Stage 1: SGLD in embedding space}}
-    \State Initialise $K$ chains: $\mathbf{e}^{(j)}_0 \gets \texttt{wte}(\text{random tokens}),\; j = 1, \ldots, K$
+    \State \textcolor{gray}{\textit{// Stage 1: Gumbel-Softmax SGLD in logit space}}
+    \State Initialise $K$ chains: $\boldsymbol{\lambda}^{(j)}_0 \gets \text{one-hot-logits}(\text{random tokens}),\; j = 1, \ldots, K$
     \For{$t = 0, 1, \ldots, T_{\max}$}
-        \State $\mathbf{e}^{(j)}_{t+1} \gets \mathbf{e}^{(j)}_t + \frac{\varepsilon}{2}\, \text{clip}\bigl(\nabla_{\mathbf{e}} E(\mathbf{e}^{(j)}_t),\, G_{\text{embed}}\bigr) + \sqrt{\varepsilon}\;\boldsymbol{\eta}_t$ \Comment{Eq.~\eqref{eq:langevin}}
+        \State $\tau_t \gets \tau_{\text{start}} + \frac{t}{T_{\max}-1}(\tau_{\text{end}} - \tau_{\text{start}})$ \Comment{Anneal softmax temperature}
+        \State $\tilde{\mathbf{e}}^{(j)} \gets \text{softmax}(\boldsymbol{\lambda}^{(j)}_t / \tau_t) \cdot W_e$ \Comment{Soft token embeddings, Eq.~\eqref{eq:softmax_bridge}}
+        \State $Q^{(j)} \gets Q_\phi(\text{transformer}(\tilde{\mathbf{e}}^{(j)}))$ \Comment{Energy via Eq.~\eqref{eq:energy}}
+        \State $\boldsymbol{\lambda}^{(j)}_{t+1} \gets \boldsymbol{\lambda}^{(j)}_t + \frac{\varepsilon}{2}\, \text{clip}\bigl(\nabla_{\boldsymbol{\lambda}} E,\, G\bigr) + \sqrt{\varepsilon}\;\boldsymbol{\eta}_t$ \Comment{Langevin update, Eq.~\eqref{eq:langevin}}
         \If{$t \geq B$ and $(t - B) \bmod T = 0$}
-            \State Collect $\mathbf{e}^{(1)}_t, \ldots, \mathbf{e}^{(K)}_t$
+            \State Collect $\boldsymbol{\lambda}^{(1)}_t, \ldots, \boldsymbol{\lambda}^{(K)}_t$
         \EndIf
     \EndFor
     \Statex
-    \State \textcolor{gray}{\textit{// Stage 2: Snap to discrete tokens}}
-    \State For each collected sample $\mathbf{e}$, compute $\mathbf{t} = \text{snap}(\mathbf{e})$ via Eq.~\eqref{eq:snap}
+    \State \textcolor{gray}{\textit{// Stage 2: Token extraction (argmax --- no snap)}}
+    \State For each collected $\boldsymbol{\lambda}$, compute $t_i = \arg\max_v \lambda_{i,v}$ via Eq.~\eqref{eq:snap}
     \Statex
     \State \textcolor{gray}{\textit{// Stage 3: RAG retrieval}}
     \State Embed query texts $\{\text{decode}(\mathbf{t})\}$ with sentence-transformer
@@ -284,12 +304,11 @@ This produces a discrete token sequence $\mathbf{t} = (t_1, \ldots, t_L)$ that i
     \State \textcolor{gray}{\textit{// Stage 4: Q update (for previous transition, if $k > 0$)}}
     \State $H_k \gets \textsc{DetachedHidden}(\theta, \text{retrieved examples})$ \Comment{$[R, d]$}
     \State Compute $V_k$ from $Q_{\bar{\phi}}(H_k)$ as in Eq.~\eqref{eq:bellman}
-    \State $h_{\text{prev}} \gets \textsc{Hidden}(\theta, a_{\text{prev}})$ \Comment{Detached by default; with-grad if \texttt{--td\_into\_theta}}
-    \State Update $\phi$ (and optionally $\theta$) to minimise $\frac{1}{2}(Q_\phi(h_{\text{prev}}) - [(1-\gamma)\,r_{\text{prev}} + \gamma\,V_k])^2$
+    \State Update $\phi$ to minimise $\frac{1}{2}(Q_\phi(h_{\text{prev}}) - [(1-\gamma)\,r_{\text{prev}} + \gamma\,V_k])^2$
     \State $\bar{\phi} \gets \tau\,\phi + (1-\tau)\,\bar{\phi}$
     \Statex
-    \State \textcolor{gray}{\textit{// Stage 5: LM training (unweighted)}}
-    \State $\theta \gets \theta - \alpha\,\nabla_\theta \frac{1}{R}\sum_{i=1}^{R} \ell(\theta, x_i)$ \Comment{Uniform loss over retrieved examples}
+    \State \textcolor{gray}{\textit{// Stage 5: LM training}}
+    \State $\theta \gets \theta - \alpha\,\nabla_\theta \sum_{i=1}^{R} w_i\, \ell(\theta, x_i)$ \Comment{$w_i = 1/R$ (uniform) or $w_i = \pi_i$ (Q-weighted)}
     \Statex
     \State \textcolor{gray}{\textit{// Stage 6: Reward}}
     \State $r_k \gets \frac{1}{M}\log p_\theta(\hat{D}_k)$ \Comment{Held-out evaluation}
@@ -297,22 +316,25 @@ This produces a discrete token sequence $\mathbf{t} = (t_1, \ldots, t_L)$ that i
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{LM training is unweighted.} Unlike the discrete-Q approach (Section~\ref{sec:algorithm}), the LM trains on the retrieved examples with \emph{uniform} loss. The curriculum signal is not in the \emph{weights} on examples but in \emph{which} examples are retrieved. The Q-network's preferences are expressed through the SGLD $\to$ snap $\to$ RAG pipeline, which acts as a soft argmax: the Langevin dynamics finds high-Q regions of embedding space, these are projected to queries, and the queries pull relevant real data from the corpus.
+\paragraph{Why logit-space SGLD avoids the snap bottleneck.} In the legacy embedding-space approach, Langevin dynamics in $\mathbb{R}^d$ per position pushes embeddings into regions far from any token (snap cosine similarity $\approx 0.22$, barely above the random baseline of $0.17$), and nearest-neighbor snapping destroys the optimised information. In the Gumbel-Softmax approach, the softmax constraint ensures the transformer's input is always a convex combination of real token embeddings. The Q-network's gradients flow through the softmax into the logits, directly shaping which tokens are favoured. As $\tau_t$ decreases, the softmax sharpens and the dominant token emerges naturally---$\arg\max$ simply reads it off.
 
-\paragraph{Q-learning is off-policy.} The Q-network update is identical to the discrete-Q version: observe reward $r_k$, compute the TD target from the target network, and minimise the squared TD error. The Q-learner does not need to know how the training data was selected---it only observes the resulting reward. This makes the Langevin-RAG pipeline compatible with the same normalised discounted soft Bellman equation (Eq.~\eqref{eq:bellman}).
+\paragraph{LM training (uniform or Q-weighted).} The LM can train on retrieved examples with either \emph{uniform} loss ($w_i = 1/R$) or \emph{Q-weighted} loss ($w_i = \text{softmax}(Q(h_i)/\beta)$). In the uniform case, the curriculum signal is entirely in \emph{which} examples are retrieved. In the Q-weighted case, examples the Q-network considers more valuable receive a larger share of the gradient, combining selection and weighting.
 
-\paragraph{Computational cost.} SGLD dominates the per-step cost ($\sim\!56\%$ of wall time), as it requires backpropagating through the full transformer at each Langevin step. RAG retrieval is negligible ($<\!1\%$). LM training accounts for $\sim\!13\%$, and held-out reward evaluation for $\sim\!26\%$. On an H100, each step takes $\sim\!3.7$s with the default parameters ($K=8$ chains, $T_{\max}=100$ steps, $L=64$ tokens, batch size 16).
+\paragraph{Q-learning is off-policy.} The Q-network update is identical to the discrete-Q version: observe reward $r_k$, compute the TD target from the target network, and minimise the squared TD error. The Q-learner does not need to know how the training data was selected---it only observes the resulting reward. This makes the pipeline compatible with the same normalised discounted soft Bellman equation (Eq.~\eqref{eq:bellman}).
+
+\paragraph{Shared structure.} The same GPT-2 model (parameters $\theta$) is used for both the SGLD energy computation (with the Q-head) and the LM training. The Q-head is a small MLP ($d \to 32 \to 1$) that reads the transformer's last-layer hidden state. This maximises parameter sharing: the Q-network's gradient signal during SGLD flows through the same transformer representations that get updated during LM training.
 
 \subsection{SGLD Diagnostics}\label{sec:sgld_diagnostics}
 
 Monitoring SGLD health is critical for tuning the Langevin hyperparameters. We track:
 
 \begin{itemize}[nosep]
-    \item \textbf{Q gain} ($\Delta Q$): The difference between Q-values of collected samples and Q-values at initialisation. Positive $\Delta Q$ indicates that SGLD is climbing the Q landscape. Empirically, $\Delta Q$ grows from $\sim\!0.2$ early in training to $\sim\!0.8$ as the Q-network develops more structured gradients.
-    \item \textbf{Random-Q baseline}: Q-values of fresh random embeddings, evaluated each step. This provides an \emph{unbiased} reference---the Q-values of collected samples are biased high by construction. The gap between SGLD Q and random Q measures the informativeness of the Langevin search.
-    \item \textbf{Diversity}: Pairwise cosine similarity of collected embedding vectors (lower $=$ more diverse), fraction of unique token sequences, and pairwise Jaccard similarity of token sets. With well-tuned parameters, all samples should be distinct (unique ratio $= 1.0$) and nearly orthogonal (cosine $\sim\!0.01$).
-    \item \textbf{Gradient health}: Mean gradient norm and fraction of steps where gradient clipping activates. High clip fractions ($>\!50\%$) suggest the step size $\varepsilon$ or clip threshold $G_{\text{embed}}$ may need adjustment.
-    \item \textbf{Per-phase timing}: Wall-clock seconds for SGLD, RAG, LM training, and reward evaluation, shown as both absolute values and percentages.
+    \item \textbf{Q gain} ($\Delta Q$): The difference between Q-values of collected samples and Q-values at initialisation. Positive $\Delta Q$ indicates that SGLD is climbing the Q landscape.
+    \item \textbf{Random-Q baseline}: Q-values of fresh random logits, evaluated each step. This provides an \emph{unbiased} reference---the Q-values of collected samples are biased high by construction.
+    \item \textbf{Softmax sharpness}: The mean entropy $H = -\sum_v \pi_v \log \pi_v$ and mean max-probability $\max_v \pi_v$ of the softmax distribution at the final temperature $\tau_{\text{end}}$. Low entropy / high max-probability indicates convergence to well-defined token choices. This replaces the snap cosine similarity metric of the legacy approach and is more interpretable: a max-probability of $0.9$ means the dominant token accounts for $90\%$ of the soft embedding's weight.
+    \item \textbf{Diversity}: Pairwise cosine similarity of collected soft embedding vectors (lower $=$ more diverse), and pairwise Jaccard similarity of extracted token sets.
+    \item \textbf{Gradient health}: Mean gradient norm and fraction of steps where gradient clipping activates.
+    \item \textbf{Per-phase timing}: Wall-clock seconds for SGLD, RAG, LM training, and reward evaluation.
 \end{itemize}
 
 \subsection{Interpretation as Free-Energy Minimisation}\label{sec:freeenergy}
