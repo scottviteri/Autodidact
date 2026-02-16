@@ -90,17 +90,17 @@ class AutodidactConfig:
     # --- Langevin-RAG mode (default) ---
     langevin_rag: bool = True         # Use Langevin Q-guided search + RAG retrieval
     langevin_seq_len: int = 128        # Sequence length for Langevin embedding optimization
-    langevin_num_chains: int = 16      # K: parallel Langevin chains
-    langevin_num_samples: int = 8     # Total samples to collect from Langevin
+    langevin_num_chains: int = 128      # K: parallel Langevin chains
+    langevin_num_samples: int = 128     # Total samples to collect from Langevin
     langevin_steps: int = 100         # Total Langevin steps (burn-in + collection)
-    langevin_burn_in: int = 50        # Discard first N steps
-    langevin_thin: int = 5            # Keep every N-th sample after burn-in
+    langevin_burn_in: int = 80        # Discard first N steps
+    langevin_thin: int = 10            # Keep every N-th sample after burn-in
     langevin_step_size: float = 0.01  # Langevin step size epsilon
     langevin_temperature: float = 1.0 # Sampling temperature (scales energy)
     langevin_noise_scale: float = 1.0 # Multiplier on Gaussian noise term
     langevin_grad_clip: float = 1.0   # Clip embedding gradients per chain
-    langevin_batch_size: int = 256     # Chains to process in parallel in _energy()
-    lm_micro_batch_size: int = 256     # Micro-batch size for gradient-accumulated LM training
+    langevin_batch_size: int = 128     # Chains to process in parallel in _energy()
+    lm_micro_batch_size: int = 512     # Micro-batch size for gradient-accumulated LM training
     rag_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     rag_index_size: int = 50000       # Number of dataset windows to index
-    rag_top_k: int = 8                # Retrieved examples per query
+    rag_top_k: int = 4                # Retrieved examples per query
