@@ -271,16 +271,23 @@ Unlike the legacy approach (nearest-neighbor cosine similarity in $\mathbb{R}^d$
 
 \subsection{RAG Retrieval}\label{sec:rag}
 
-\paragraph{Index construction (once, at startup).} We stream through the training corpus and extract $I$ fixed-length token windows. Each window is decoded to text and embedded with a pretrained sentence-transformer model (all-MiniLM-L6-v2, $d_{\text{st}} = 384$), producing normalised embedding vectors. These are stored in a FAISS inner-product index for efficient nearest-neighbor search.
+\paragraph{Index construction and rolling refresh.} At startup we stream through the training corpus, extract $I$ fixed-length token windows, embed them with a pretrained sentence-transformer (all-MiniLM-L6-v2, $d_{\text{st}} = 384$, normalised), and store the resulting vectors in a FAISS \texttt{IndexFlatIP} (flat brute-force inner product---no tree or quantisation). The embeddings, token IDs, and decoded texts are held in a fixed-size \emph{ring buffer} of capacity~$I$.
 
-\paragraph{Query and retrieval (each step).} The $S$ discrete query sequences from the token extraction step are decoded to text and embedded with the same sentence-transformer. For each query, the top-$k$ nearest neighbours in the FAISS index are retrieved by cosine similarity. Results are deduplicated across all queries to produce $R \leq S \cdot k$ unique training examples.
+Each training step, $n_{\text{ingest}}$ fresh windows are consumed from the data stream, embedded, and written into the ring buffer at the current write head, overwriting the oldest entries. The FAISS index is then rebuilt from the updated embedding matrix. Because \texttt{IndexFlatIP} is just a dense matrix, rebuilding for $I = 50{,}000$ vectors of dimension~384 amounts to a single \texttt{memcpy} ($< 5$\,ms). With $n_{\text{ingest}} = 100$ and $I = 50{,}000$, each step replaces $0.2\%$ of the index. The full buffer turns over after 500 steps---the same total throughput as a bulk refresh every 500 steps, but spread smoothly to avoid the LM loss jumps caused by a sudden distribution shift.
+
+\paragraph{Query and retrieval (each step).} The $K$ discrete query sequences from the token extraction step are decoded to text and embedded with the same sentence-transformer. For each query, the top-$k$ nearest neighbours in the FAISS index are retrieved by cosine similarity. By default, one result is \emph{softmax-sampled} from the top-$k$ per query rather than taking the deterministic top-1:
+\begin{equation}\label{eq:rag_sample}
+    p_j \propto \exp\!\bigl(\text{score}_j \,/\, \tau_{\text{rag}}\bigr), \qquad j = 1, \ldots, k,
+\end{equation}
+where $\tau_{\text{rag}}$ is a sampling temperature (default 0.1). This gives diversity: instead of every query selecting its single nearest neighbour (which often overlap), each query draws from its local neighbourhood, producing a more varied retrieved set. Results are deduplicated across all queries to produce $R \leq K$ unique training examples.
 
 \subsection{Softmax-Relaxed Langevin-RAG Algorithm}\label{sec:langevin_algorithm}
 
 \begin{algorithm}[h]
 \caption{Curriculum Selection via Softmax-Relaxed Langevin-RAG}
 \begin{algorithmic}[1]
-\State \textbf{Initialise:} LM parameters $\theta$; Q-network $\phi$; target $\bar{\phi} \gets \phi$; FAISS index over $I$ corpus windows
+\State \textbf{Initialise:} LM parameters $\theta$; Q-network $\phi$; target $\bar{\phi} \gets \phi$
+\State Build FAISS ring buffer of capacity $I$ from first $I$ corpus windows (Section~\ref{sec:rag})
 \Statex
 \For{$k = 0, 1, 2, \ldots$}
     \Statex
@@ -297,9 +304,10 @@ Unlike the legacy approach (nearest-neighbor cosine similarity in $\mathbb{R}^d$
     \State \textcolor{gray}{\textit{// Stage 2: Token extraction (argmax --- no snap)}}
     \State For each collected $\boldsymbol{\lambda}$, compute $t_i = \arg\max_v \lambda_{i,v}$ via Eq.~\eqref{eq:snap}
     \Statex
-    \State \textcolor{gray}{\textit{// Stage 3: RAG retrieval}}
+    \State \textcolor{gray}{\textit{// Stage 3: RAG retrieval + rolling refresh}}
     \State Embed query texts $\{\text{decode}(\mathbf{t})\}$ with sentence-transformer
-    \State Retrieve $R$ unique training examples from FAISS index
+    \State Retrieve $R$ unique training examples via softmax-sampling from top-$k$ (Eq.~\eqref{eq:rag_sample})
+    \State Ingest $n_{\text{ingest}}$ fresh windows into ring buffer; rebuild FAISS index
     \Statex
     \State \textcolor{gray}{\textit{// Stage 4: Q update (for previous transition, if $k > 0$)}}
     \State $H_k \gets \textsc{DetachedHidden}(\theta, \text{retrieved examples})$ \Comment{$[R, d]$}

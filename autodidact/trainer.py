@@ -874,18 +874,27 @@ class LangevinRAGTrainer:
     Trainer that uses Langevin-dynamics Q-guided search + RAG retrieval.
 
     Pipeline per step:
-        1. Run Langevin dynamics in GPT-2 embedding space, using Q(s,a) as
-           the energy function, to find continuous embeddings with high Q-value.
-        2. Snap continuous embeddings to discrete tokens via nearest-neighbor
-           lookup against the wte embedding matrix.
-        3. Embed the resulting "query sentences" with a sentence-transformer,
-           search a pre-built FAISS index of the training dataset, and
-           retrieve top-k real training examples.
-        4. Train the LM on the retrieved examples. When no_q_weighting=True
-           (default), uses uniform loss. When no_q_weighting=False, weights
-           each example by pi = softmax(Q/beta), so examples the Q-network
-           considers more valuable receive a larger share of the gradient.
-        5. Compute reward on held-out data and update the Q-network via the
+        1. Softmax-relaxed SGLD in logit space: maintain K parallel chains,
+           each a tensor of logits [seq_len, V]. At each Langevin step, form
+           soft token embeddings via softmax(logits/tau) @ W_e, feed through
+           the transformer + Q-head, backprop dQ/d(logits), and apply the
+           Langevin update. After burn-in, collect one sample per chain.
+        2. Token extraction: argmax of the optimized logits at each position.
+           No lossy nearest-neighbor snap -- the argmax IS the dominant mode
+           of the softmax distribution that SGLD optimized.
+        3. RAG retrieval: embed the K query sentences with a sentence-
+           transformer, search the FAISS ring-buffer index, and softmax-
+           sample one result per query from the top-k candidates. Deduplicate
+           across queries to get R <= K unique training examples.
+        4. Rolling refresh: ingest n_ingest fresh windows from the data stream
+           into the ring buffer, overwriting the oldest entries, and rebuild
+           the FAISS index. This keeps the index fresh without the LM loss
+           jumps caused by atomically replacing the entire index.
+        5. Train the LM on the retrieved examples. When no_q_weighting=True,
+           uses uniform loss. When no_q_weighting=False, weights each example
+           by pi = softmax(Q/beta), so examples the Q-network considers more
+           valuable receive a larger share of the gradient.
+        6. Compute reward on held-out data and update the Q-network via the
            standard normalised discounted soft Bellman equation.
 
     The Q-network still learns from the reward signal, so it improves its
@@ -1349,11 +1358,12 @@ class LangevinRAGTrainer:
         Run the Langevin-RAG training loop.
 
         Each step:
-            1. Langevin dynamics -> query token IDs
-            2. RAG retrieval -> real training examples
-            3. Unweighted LM training on retrieved examples
-            4. Reward computation on held-out data
-            5. Q-network update (soft Bellman)
+            1. Softmax-relaxed SGLD in logit space -> K query token IDs
+            2. RAG retrieval (softmax-sample 1 from top-k per query) -> R examples
+            3. Rolling refresh: ingest fresh windows into RAG ring buffer
+            4. Q-network update (soft Bellman) for previous transition
+            5. LM training on retrieved examples (uniform or Q-weighted)
+            6. Reward computation on held-out data
 
         For the Q-network update, we need a hidden state from a "selected action".
         We use the first retrieved example's hidden state as the representative
