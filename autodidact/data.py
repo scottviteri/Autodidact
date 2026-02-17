@@ -2,27 +2,45 @@
 Data streaming and held-out set management.
 
 Provides:
-- A streaming data source that yields fresh batches of N candidate context windows.
-- A fixed held-out evaluation set D, with random subset sampling of size M each step.
+- DataStream: a single sequential stream over a tokenized dataset.
+  All consumers (held-out set, RAG index, training batches) draw from
+  the same stream in order, guaranteeing zero overlap.
+- HeldOutSet: a fixed held-out evaluation set D, built from pre-consumed
+  data, with random subset sampling of size M each step.
 - TopicSimilarityTracker: measures cosine similarity between candidate texts
   and the held-out set using sentence-transformer embeddings.
 """
 
 import torch
 import numpy as np
-from torch.utils.data import IterableDataset
 from transformers import PreTrainedTokenizerFast
 from datasets import load_dataset
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 
-class StreamingTextDataset(IterableDataset):
+class DataStream:
     """
-    Wraps a HuggingFace streaming dataset to yield tokenized context windows.
-    Each call to __iter__ yields a single tokenized context window of length `seq_len`.
-    
-    Uses a token buffer to pack text efficiently: documents are concatenated and
-    sliced into fixed-length windows, avoiding padding waste.
+    Single sequential stream over a tokenized dataset.
+
+    Opens one HuggingFace streaming iterator and maintains a token buffer.
+    All consumers draw from the same stream in order:
+
+        stream = DataStream(tokenizer, seq_len, "openwebtext")
+
+        # 1. Held-out set (first chunk)
+        held_out_tokens, held_out_texts = stream.consume_windows(2048)
+
+        # 2. RAG index (next chunk)
+        rag_tokens, rag_texts = stream.consume_windows(50000)
+
+        # 3. Training batches (continues from here)
+        batch = stream.next_batch(256, device)
+
+        # 4. RAG refresh (keeps reading forward)
+        fresh_tokens, fresh_texts = stream.consume_windows(50000)
+
+    No overlap, no skipping, deterministic ordering.  If the stream is
+    exhausted, it wraps around by creating a new iterator.
     """
 
     def __init__(
@@ -32,41 +50,72 @@ class StreamingTextDataset(IterableDataset):
         dataset_name: str = "openwebtext",
         split: str = "train",
     ):
-        super().__init__()
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.dataset_name = dataset_name
         self.split = split
 
-    def __iter__(self) -> Iterator[torch.Tensor]:
-        dataset = load_dataset(self.dataset_name, split=self.split, streaming=True)
-        buffer = []
-        for example in dataset:
+        self._stream = iter(load_dataset(dataset_name, split=split, streaming=True))
+        self._buffer: List[int] = []
+        self._total_windows_consumed = 0
+
+    def _restart_stream(self):
+        """Restart the underlying HuggingFace streaming iterator."""
+        print(f"[DataStream] Stream exhausted after {self._total_windows_consumed} "
+              f"windows. Restarting from beginning...")
+        self._stream = iter(
+            load_dataset(self.dataset_name, split=self.split, streaming=True)
+        )
+        self._buffer = []
+
+    def _fill_buffer(self, min_tokens: int):
+        """Read documents until the buffer has at least `min_tokens` tokens."""
+        while len(self._buffer) < min_tokens:
+            try:
+                example = next(self._stream)
+            except StopIteration:
+                self._restart_stream()
+                example = next(self._stream)
             text = example["text"]
             tokens = self.tokenizer.encode(text, add_special_tokens=False)
-            buffer.extend(tokens)
-            while len(buffer) >= self.seq_len:
-                yield torch.tensor(buffer[: self.seq_len], dtype=torch.long)
-                buffer = buffer[self.seq_len :]
+            self._buffer.extend(tokens)
 
+    def consume_windows(self, count: int) -> Tuple[List[List[int]], List[str]]:
+        """
+        Consume exactly `count` fixed-length token windows from the stream.
 
-class CandidateBatchSampler:
-    """
-    Draws batches of N candidate context windows from a streaming dataset.
-    Each call to next_batch() returns a fresh [N, seq_len] tensor.
-    """
+        Returns:
+            tokens_list: list of `count` token lists, each of length seq_len
+            texts_list:  list of `count` decoded text strings
+        """
+        tokens_list = []
+        texts_list = []
+        while len(tokens_list) < count:
+            self._fill_buffer(self.seq_len)
+            window_tokens = self._buffer[:self.seq_len]
+            self._buffer = self._buffer[self.seq_len:]
+            tokens_list.append(window_tokens)
+            texts_list.append(self.tokenizer.decode(window_tokens))
+        self._total_windows_consumed += count
+        return tokens_list, texts_list
 
-    def __init__(self, dataset: StreamingTextDataset, batch_size: int, device: torch.device):
-        self.iterator = iter(dataset)
-        self.batch_size = batch_size
-        self.device = device
+    def next_window(self) -> torch.Tensor:
+        """Consume and return a single [seq_len] token tensor."""
+        self._fill_buffer(self.seq_len)
+        window_tokens = self._buffer[:self.seq_len]
+        self._buffer = self._buffer[self.seq_len:]
+        self._total_windows_consumed += 1
+        return torch.tensor(window_tokens, dtype=torch.long)
 
-    def next_batch(self) -> torch.Tensor:
-        """Returns [N, seq_len] tensor of candidate context windows."""
-        candidates = []
-        for _ in range(self.batch_size):
-            candidates.append(next(self.iterator))
-        return torch.stack(candidates).to(self.device)
+    def next_batch(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Consume and return a [batch_size, seq_len] tensor of token windows."""
+        windows = [self.next_window() for _ in range(batch_size)]
+        return torch.stack(windows).to(device)
+
+    @property
+    def total_consumed(self) -> int:
+        """Total number of windows consumed from the stream so far."""
+        return self._total_windows_consumed
 
 
 class HeldOutSet:
@@ -75,13 +124,11 @@ class HeldOutSet:
     Supports sampling fresh random subsets of size M each step.
 
     Two modes:
-        1. Random (default): Collect `total_size` windows from the dataset.
-        2. Topic-coherent (`topic_coherent=True`): Load a larger pool, pick a
-           random anchor, then sample `total_size` windows with probability
-           proportional to their cosine similarity to the anchor in
-           sentence-embedding space.  A temperature parameter controls the
-           tightness of the topic cluster: low temperature → tight cluster
-           around the anchor's topic, high temperature → approaches uniform.
+        1. Random (default): Use pre-consumed windows directly.
+        2. Topic-coherent (`topic_coherent=True`): From a larger pre-consumed
+           pool, pick a random anchor and sample `total_size` windows with
+           probability proportional to cosine similarity to the anchor in
+           sentence-embedding space.
 
     The topic-coherent mode is designed for the "generalized needle" setting:
     the held-out set is thematically coherent (stable reward signal) while
@@ -90,64 +137,35 @@ class HeldOutSet:
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizerFast,
-        seq_len: int = 512,
-        total_size: int = 1024,
-        dataset_name: str = "openwebtext",
-        split: str = "train",
+        pool_data: torch.Tensor,
+        pool_texts: List[str],
         device: torch.device = torch.device("cpu"),
         # --- Topic-coherent sampling ---
         topic_coherent: bool = False,
-        topic_pool_size: int = 4096,
+        total_size: Optional[int] = None,
         topic_temperature: float = 0.1,
         topic_sim_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     ):
         self.device = device
-        self.total_size = total_size
-        self.seq_len = seq_len
+        self.seq_len = pool_data.shape[1]
         self.topic_coherent = topic_coherent
         self.anchor_text = None  # set when topic_coherent=True
 
-        # Determine how many windows to load from the dataset
-        pool_size = topic_pool_size if topic_coherent else total_size
-
-        # Build the pool by consuming from the dataset.
-        # We use a different slice of the data by skipping ahead.
-        dataset = load_dataset(dataset_name, split=split, streaming=True)
-        buffer = []
-        examples = []
-        # Skip some data to avoid overlap with training stream.
-        # We'll consume and discard some initial examples, then collect.
-        skip_count = 5000  # Skip first 5k documents for held-out
-        count = 0
-        for example in dataset:
-            count += 1
-            if count <= skip_count:
-                continue
-            text = example["text"]
-            tokens = tokenizer.encode(text, add_special_tokens=False)
-            buffer.extend(tokens)
-            while len(buffer) >= seq_len and len(examples) < pool_size:
-                examples.append(torch.tensor(buffer[:seq_len], dtype=torch.long))
-                buffer = buffer[seq_len:]
-            if len(examples) >= pool_size:
-                break
-
-        pool_data = torch.stack(examples)  # [pool_size, seq_len]
-        pool_texts = [
-            tokenizer.decode(pool_data[i].tolist()) for i in range(pool_data.shape[0])
-        ]
-
         if topic_coherent:
+            assert total_size is not None, (
+                "total_size is required for topic-coherent mode "
+                "(pool_data should be larger than total_size)"
+            )
             self._build_topic_coherent(
-                pool_data, pool_texts, total_size, topic_temperature, topic_sim_model,
-                str(device),
+                pool_data, pool_texts, total_size, topic_temperature,
+                topic_sim_model, str(device),
             )
         else:
             self.data = pool_data.to(device)
             self.texts = pool_texts
 
-        print(f"Held-out set: {self.data.shape[0]} examples of length {self.seq_len}"
+        self.total_size = self.data.shape[0]
+        print(f"Held-out set: {self.total_size} examples of length {self.seq_len}"
               f"{' (topic-coherent)' if topic_coherent else ''}")
 
     def _build_topic_coherent(
@@ -306,4 +324,3 @@ class TopicSimilarityTracker:
             "best_sim": float(sims[best_idx]),
             "mean_sim": float(np.mean(sims)),
         }
-

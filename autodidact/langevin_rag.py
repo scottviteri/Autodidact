@@ -1,8 +1,8 @@
 """
-Gumbel-Softmax Langevin dynamics + RAG retrieval for curriculum selection.
+Softmax-relaxed Langevin dynamics + RAG retrieval for curriculum selection.
 
 Pipeline (per training step):
-    1. Langevin sampling in logit space (Gumbel-Softmax SGLD):
+    1. Langevin sampling in logit space (softmax-relaxed SGLD):
        - Maintain K parallel chains, each a tensor of logits [seq_len, V]
          over the vocabulary at every token position.
        - At each Langevin step, form soft token embeddings via
@@ -43,10 +43,10 @@ from .q_network import QNetwork
 
 
 # ---------------------------------------------------------------------------
-# 1. Gumbel-Softmax Langevin dynamics sampler
+# 1. Softmax-relaxed Langevin dynamics sampler
 # ---------------------------------------------------------------------------
 
-class GumbelSoftmaxQSampler:
+class SoftmaxQSampler:
     """
     Uses Langevin dynamics in **logit space** to find token distributions
     that maximise the Q-value, with a softmax-to-embedding bridge ensuring
@@ -67,9 +67,16 @@ class GumbelSoftmaxQSampler:
     Token extraction:
         tokens = argmax(logits, dim=-1)              [K, seq_len]
 
-    The softmax temperature tau can optionally be annealed from tau_start
-    (high, exploratory) to tau_end (low, sharp) over the Langevin steps,
+    The softmax temperature tau is annealed from tau_start (high,
+    exploratory) to tau_end (low, sharp) over the Langevin steps,
     smoothly transitioning from a broad search to a peaked selection.
+
+    Note: despite the historical name "Gumbel-Softmax" in earlier versions,
+    this method uses plain softmax (no Gumbel noise). The gradient path
+    logits -> softmax -> embeddings -> transformer -> Q is fully
+    differentiable, so there is no need for the Gumbel reparameterisation
+    trick. The softmax serves purely as a differentiable bridge from
+    unconstrained logits to the token-embedding manifold.
     """
 
     def __init__(
@@ -84,9 +91,9 @@ class GumbelSoftmaxQSampler:
         noise_scale: float = 1.0,       # multiplier on the Gaussian noise term
         grad_clip: float = 1.0,         # clip logit gradients per chain
         langevin_batch_size: int = 64,  # chains to process in parallel in _energy()
-        # Gumbel-Softmax specific
-        gumbel_tau_start: float = 2.0,  # softmax temperature at step 0 (high = soft)
-        gumbel_tau_end: float = 0.5,    # softmax temperature at final step (low = sharp)
+        # Softmax bridge temperature annealing
+        softmax_tau_start: float = 2.0, # softmax temperature at step 0 (high = soft)
+        softmax_tau_end: float = 0.5,   # softmax temperature at final step (low = sharp)
         device: torch.device = torch.device("cpu"),
     ):
         self.model = model
@@ -99,8 +106,8 @@ class GumbelSoftmaxQSampler:
         self.noise_scale = noise_scale
         self.grad_clip = grad_clip
         self.langevin_batch_size = langevin_batch_size
-        self.gumbel_tau_start = gumbel_tau_start
-        self.gumbel_tau_end = gumbel_tau_end
+        self.softmax_tau_start = softmax_tau_start
+        self.softmax_tau_end = softmax_tau_end
         self.device = device
 
         # Cache the token embedding matrix (frozen copy for the softmax @ wte bridge)
@@ -152,7 +159,7 @@ class GumbelSoftmaxQSampler:
 
         Args:
             logits: [K, seq_len, V] (requires_grad).
-            tau: softmax temperature for the Gumbel-Softmax bridge.
+            tau: softmax temperature for the softmax bridge.
 
         Returns:
             q_vals: [K] scalar Q-values (differentiable w.r.t. logits).
@@ -168,7 +175,7 @@ class GumbelSoftmaxQSampler:
             logit_batch = logits[i : i + bs]  # [bs, seq_len, V]
 
             with torch.enable_grad():
-                # Gumbel-Softmax bridge: logits -> soft tokens -> soft embeddings
+                # Softmax bridge: logits -> soft tokens -> soft embeddings
                 soft_tokens = F.softmax(logit_batch / tau, dim=-1)  # [bs, seq_len, V]
                 soft_embeds = soft_tokens @ self._wte               # [bs, seq_len, d]
 
@@ -215,7 +222,7 @@ class GumbelSoftmaxQSampler:
 
     def sample(self) -> Tuple[torch.Tensor, dict]:
         """
-        Run Gumbel-Softmax Langevin dynamics and return discrete query
+        Run softmax-relaxed Langevin dynamics and return discrete query
         token sequences along with rich diagnostics.
 
         Returns:
@@ -244,7 +251,7 @@ class GumbelSoftmaxQSampler:
                 Best sample:
                   best_q_sample_idx
                 Temperature:
-                  final_tau: the Gumbel-Softmax temperature at collection
+                  final_tau: the softmax temperature at collection
         """
         import time as _time
 
@@ -259,8 +266,8 @@ class GumbelSoftmaxQSampler:
         logits.requires_grad_(True)
 
         # Temperature annealing schedule (linear from tau_start to tau_end)
-        tau_start = self.gumbel_tau_start
-        tau_end = self.gumbel_tau_end
+        tau_start = self.softmax_tau_start
+        tau_end = self.softmax_tau_end
         n_steps = self.burn_in
 
         def _get_tau(t):
@@ -457,7 +464,7 @@ class GumbelSoftmaxQSampler:
 class LangevinQSampler:
     """
     [LEGACY] Langevin dynamics in raw embedding space with nearest-neighbor
-    snap-to-tokens. Superseded by GumbelSoftmaxQSampler which avoids the
+    snap-to-tokens. Superseded by SoftmaxQSampler which avoids the
     snap bottleneck by operating in logit space.
 
     Uses Langevin dynamics to find input embeddings that maximise the Q-value.
@@ -478,9 +485,9 @@ class LangevinQSampler:
         grad_clip: float = 1.0,
         langevin_batch_size: int = 4,
         device: torch.device = torch.device("cpu"),
-        # Ignored Gumbel-Softmax params (for interface compat)
-        gumbel_tau_start: float = 2.0,
-        gumbel_tau_end: float = 0.5,
+        # Ignored softmax params (for interface compat)
+        softmax_tau_start: float = 2.0,
+        softmax_tau_end: float = 0.5,
     ):
         self.model = model
         self.q_net = q_net
@@ -679,8 +686,9 @@ class RAGIndex:
     Builds and queries a FAISS index over sentence embeddings of a text dataset.
 
     Uses sentence-transformers (all-MiniLM-L6-v2 by default) for encoding.
-    The index is built once at startup from the streaming dataset, then
-    queried each step with the Langevin-generated query sentences.
+    The index is built from pre-consumed data (provided by the caller, typically
+    a DataStream), then queried each step with the Langevin-generated query
+    sentences.  Refreshes are also driven by the caller passing in fresh data.
     """
 
     def __init__(
@@ -708,38 +716,18 @@ class RAGIndex:
         self.stored_token_ids = None     # [index_size, seq_len] token IDs
         self.stored_texts = None         # list of decoded text strings
 
-    def build_index(self, tokenizer, seq_len: int, dataset_name: str, split: str = "train"):
+    def build_index(self, windows_tokens: list, windows_text: list):
         """
-        Stream through the dataset, tokenize into fixed-length windows,
-        embed each window's text, and build a FAISS index.
-
-        Stores the streaming iterator so that refresh_index() can continue
-        from where this left off (no overlap with the initial index).
+        Build a FAISS index from pre-consumed token windows.
 
         Args:
-            tokenizer: GPT-2 tokenizer for decoding windows back to text.
-            seq_len: Token window length.
-            dataset_name: HuggingFace dataset name.
-            split: Dataset split.
+            windows_tokens: list of token lists, each of length seq_len.
+            windows_text:   list of decoded text strings (same length).
         """
         import faiss
-        from datasets import load_dataset
-
-        print(f"[RAG] Building index from {dataset_name} ({self.index_size} windows)...")
-
-        self._tokenizer = tokenizer
-        self._seq_len = seq_len
-        self._dataset_name = dataset_name
-        self._split = split
-
-        # Create a streaming iterator we'll keep alive for refreshes
-        self._stream_iter = iter(load_dataset(dataset_name, split=split, streaming=True))
-        self._token_buffer = []
-
-        windows_tokens, windows_text = self._consume_windows(self.index_size)
 
         n = len(windows_tokens)
-        print(f"[RAG] Collected {n} windows. Embedding...")
+        print(f"[RAG] Building index from {n} pre-consumed windows. Embedding...")
 
         all_embeddings = self.embed_model.encode(
             windows_text,
@@ -754,55 +742,21 @@ class RAGIndex:
 
         self.stored_token_ids = torch.tensor(windows_tokens, dtype=torch.long)  # [n, seq_len]
         self.stored_texts = windows_text
-        self._total_windows_consumed = n
 
         print(f"[RAG] Index built: {self.index.ntotal} vectors, dim={self.embed_dim}")
 
-    def _consume_windows(self, count: int) -> Tuple[list, list]:
-        """Consume `count` token windows from the streaming dataset iterator."""
-        windows_tokens = []
-        windows_text = []
-        for example in self._stream_iter:
-            text = example["text"]
-            tokens = self._tokenizer.encode(text, add_special_tokens=False)
-            self._token_buffer.extend(tokens)
-            while len(self._token_buffer) >= self._seq_len and len(windows_tokens) < count:
-                window_tok = self._token_buffer[:self._seq_len]
-                self._token_buffer = self._token_buffer[self._seq_len:]
-                windows_tokens.append(window_tok)
-                windows_text.append(self._tokenizer.decode(window_tok))
-            if len(windows_tokens) >= count:
-                break
-        return windows_tokens, windows_text
-
-    def refresh_index(self):
+    def refresh_index(self, windows_tokens: list, windows_text: list):
         """
-        Replace the entire FAISS index with fresh data from the stream.
+        Replace the entire FAISS index with fresh pre-consumed data.
 
-        Continues reading from where the previous build/refresh left off,
-        so there is no overlap with previously indexed data. If the stream
-        is exhausted, wraps around by creating a new iterator.
+        The caller (trainer) is responsible for consuming the data from
+        the shared DataStream before calling this method.
 
-        Call this periodically (e.g. every N training steps) to prevent
-        the LM from overfitting on a fixed pool of retrieved examples.
+        Args:
+            windows_tokens: list of token lists, each of length seq_len.
+            windows_text:   list of decoded text strings (same length).
         """
         import faiss
-
-        # Try to consume fresh windows; if stream is exhausted, restart
-        windows_tokens, windows_text = self._consume_windows(self.index_size)
-        if len(windows_tokens) < self.index_size:
-            print(f"[RAG refresh] Stream exhausted after {len(windows_tokens)} windows. "
-                  f"Restarting stream...")
-            from datasets import load_dataset
-            self._stream_iter = iter(
-                load_dataset(self._dataset_name, split=self._split, streaming=True)
-            )
-            self._token_buffer = []
-            more_tokens, more_text = self._consume_windows(
-                self.index_size - len(windows_tokens)
-            )
-            windows_tokens.extend(more_tokens)
-            windows_text.extend(more_text)
 
         n = len(windows_tokens)
         all_embeddings = self.embed_model.encode(
@@ -818,10 +772,8 @@ class RAGIndex:
 
         self.stored_token_ids = torch.tensor(windows_tokens, dtype=torch.long)
         self.stored_texts = windows_text
-        self._total_windows_consumed += n
 
-        print(f"[RAG refresh] Index replaced: {n} fresh windows "
-              f"(total consumed: {self._total_windows_consumed})")
+        print(f"[RAG refresh] Index replaced: {n} fresh windows")
 
     def retrieve(
         self,
@@ -843,7 +795,7 @@ class RAGIndex:
         Results are deduplicated across all queries.
 
         Args:
-            query_ids: [B, seq_len] discrete token IDs (from Langevin/Gumbel).
+            query_ids: [B, seq_len] discrete token IDs (from Langevin sampler).
             tokenizer: GPT-2 tokenizer for decoding.
             top_k: Number of FAISS candidates per query to score.
                    Default: self.retrieval_top_k.
@@ -917,4 +869,3 @@ class RAGIndex:
         }
 
         return retrieved_ids, info
-

@@ -28,10 +28,10 @@ import time
 import math
 
 from .q_network import QNetwork, extract_hidden_states, extract_hidden_state_with_grad, compute_soft_value, boltzmann_sample
-from .data import CandidateBatchSampler, HeldOutSet, TopicSimilarityTracker
+from .data import DataStream, HeldOutSet, TopicSimilarityTracker
 from .baselines import BaselineSelector
 from .logging import MetricsLogger, DashboardPlotter, LangevinRAGDashboard
-from .langevin_rag import GumbelSoftmaxQSampler, LangevinQSampler, RAGIndex
+from .langevin_rag import SoftmaxQSampler, LangevinQSampler, RAGIndex
 
 
 def compute_lm_loss(model: GPT2LMHeadModel, input_ids: torch.Tensor) -> torch.Tensor:
@@ -418,8 +418,6 @@ class AutodidactTrainer:
         Returns:
             Path to the JSONL log file.
         """
-        from .data import StreamingTextDataset
-
         # --- Snapshot LM weights if resetting each step ---
         if self.reset_lm_each_step:
             print("[reset_lm_each_step] Snapshotting initial LM weights (theta_0). "
@@ -431,26 +429,30 @@ class AutodidactTrainer:
         logger = MetricsLogger(method_label, log_dir=self.log_dir, config=self._config_dict)
         run_dashboard = DashboardPlotter(output_path=str(logger.dashboard_file))
 
-        # --- Set up data ---
-        print("Setting up streaming dataset...")
-        stream_dataset = StreamingTextDataset(
+        # --- Set up data (single sequential stream) ---
+        print("Setting up data stream...")
+        stream = DataStream(
             tokenizer=self.tokenizer,
             seq_len=self.seq_len,
             dataset_name=self.dataset_name,
         )
-        sampler = CandidateBatchSampler(stream_dataset, self.num_candidates, self.device)
 
-        print("Building held-out evaluation set (this may take a moment)...")
+        # 1. Held-out set (first chunk from the stream)
+        pool_size = self.topic_pool_size if self.topic_coherent else self.held_out_total_size
+        print(f"Consuming {pool_size} windows for held-out set...")
+        ho_tokens, ho_texts = stream.consume_windows(pool_size)
+        ho_data = torch.tensor(ho_tokens, dtype=torch.long)
         held_out = HeldOutSet(
-            tokenizer=self.tokenizer,
-            seq_len=self.seq_len,
-            total_size=self.held_out_total_size,
-            dataset_name=self.dataset_name,
+            pool_data=ho_data,
+            pool_texts=ho_texts,
             device=self.device,
             topic_coherent=self.topic_coherent,
-            topic_pool_size=self.topic_pool_size,
+            total_size=self.held_out_total_size if self.topic_coherent else None,
             topic_temperature=self.topic_temperature,
         )
+
+        # 2. Training data continues from the same stream
+        #    (next_batch draws from the stream sequentially)
 
         # --- Topic similarity tracker ---
         topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
@@ -477,7 +479,7 @@ class AutodidactTrainer:
         # Bootstrap step (k=0): no Q update
         # =====================================================================
         print("Running bootstrap step...")
-        C_0 = sampler.next_batch()
+        C_0 = stream.next_batch(self.num_candidates, self.device)
         H_0 = extract_hidden_states(self.model, C_0, batch_size=self.extract_batch_size)
         q_0 = self.q_net(H_0)
         a_0 = boltzmann_sample(q_0, self.beta)
@@ -534,7 +536,7 @@ class AutodidactTrainer:
             step_start = time.time()
 
             # --- Forward candidates through base model (dual purpose) ---
-            C_k = sampler.next_batch()
+            C_k = stream.next_batch(self.num_candidates, self.device)
             H_k = extract_hidden_states(self.model, C_k, batch_size=self.extract_batch_size)
             q_k = self.q_net(H_k)
 
@@ -769,27 +771,25 @@ class BaselineTrainer:
         }
 
     def train(self, num_steps: int = 10000, all_log_files: Optional[List[str]] = None) -> str:
-        from .data import StreamingTextDataset
-
         logger = MetricsLogger(self.selector.name, log_dir=self.log_dir, config=self._config_dict)
         run_dashboard = DashboardPlotter(output_path=str(logger.dashboard_file))
         combined_log_files = list(all_log_files) if all_log_files else []
         combined_log_files.append(str(logger.log_file))
 
-        stream_dataset = StreamingTextDataset(
+        stream = DataStream(
             tokenizer=self.tokenizer, seq_len=self.seq_len, dataset_name=self.dataset_name,
         )
-        sampler = CandidateBatchSampler(stream_dataset, self.num_candidates, self.device)
-        held_out = HeldOutSet(
-            tokenizer=self.tokenizer, seq_len=self.seq_len,
-            total_size=self.held_out_total_size, dataset_name=self.dataset_name, device=self.device,
-        )
+        # Held-out set (first chunk from the stream)
+        ho_tokens, ho_texts = stream.consume_windows(self.held_out_total_size)
+        ho_data = torch.tensor(ho_tokens, dtype=torch.long)
+        held_out = HeldOutSet(pool_data=ho_data, pool_texts=ho_texts, device=self.device)
+        # Training data continues from the same stream
 
         cumulative_reward = 0.0
 
         for k in range(1, num_steps + 1):
             step_start = time.time()
-            C_k = sampler.next_batch()
+            C_k = stream.next_batch(self.num_candidates, self.device)
             a_k = self.selector.select(self.model, C_k)
 
             self.lm_optimizer.zero_grad()
@@ -923,11 +923,11 @@ class LangevinRAGTrainer:
         langevin_noise_scale: float = 1.0,
         langevin_grad_clip: float = 1.0,
         langevin_batch_size: int = 4,
-        # Gumbel-Softmax temperature annealing
-        gumbel_tau_start: float = 2.0,
-        gumbel_tau_end: float = 0.5,
-        # Sampler selection: "gumbel" (default) or "embedding" (legacy)
-        sampler_type: str = "gumbel",
+        # Softmax bridge temperature annealing
+        softmax_tau_start: float = 2.0,
+        softmax_tau_end: float = 0.5,
+        # Sampler selection: "softmax" (default) or "embedding" (legacy)
+        sampler_type: str = "softmax",
         # LM training micro-batching
         lm_micro_batch_size: int = 4,
         # RAG
@@ -1057,14 +1057,14 @@ class LangevinRAGTrainer:
             noise_scale=langevin_noise_scale,
             grad_clip=langevin_grad_clip,
             langevin_batch_size=langevin_batch_size,
-            gumbel_tau_start=gumbel_tau_start,
-            gumbel_tau_end=gumbel_tau_end,
+            softmax_tau_start=softmax_tau_start,
+            softmax_tau_end=softmax_tau_end,
             device=self.device,
         )
-        if sampler_type == "gumbel":
-            print(f"[LangevinRAG] Using Gumbel-Softmax sampler "
-                  f"(tau: {gumbel_tau_start} -> {gumbel_tau_end})")
-            self.langevin_sampler = GumbelSoftmaxQSampler(**sampler_kwargs)
+        if sampler_type == "softmax":
+            print(f"[LangevinRAG] Using softmax-relaxed sampler "
+                  f"(tau: {softmax_tau_start} -> {softmax_tau_end})")
+            self.langevin_sampler = SoftmaxQSampler(**sampler_kwargs)
         else:
             print(f"[LangevinRAG] Using legacy embedding-space sampler")
             self.langevin_sampler = LangevinQSampler(**sampler_kwargs)
@@ -1117,8 +1117,8 @@ class LangevinRAGTrainer:
             "langevin_step_size": langevin_step_size,
             "langevin_temperature": langevin_temperature,
             "langevin_batch_size": langevin_batch_size,
-            "gumbel_tau_start": gumbel_tau_start,
-            "gumbel_tau_end": gumbel_tau_end,
+            "softmax_tau_start": softmax_tau_start,
+            "softmax_tau_end": softmax_tau_end,
             "sampler_type": sampler_type,
             "lm_micro_batch_size": lm_micro_batch_size,
             "rag_embedding_model": rag_embedding_model,
@@ -1382,25 +1382,33 @@ class LangevinRAGTrainer:
         logger = MetricsLogger(self._config_dict["method_name"], log_dir=self.log_dir, config=self._config_dict)
         run_dashboard = LangevinRAGDashboard(output_path=str(logger.dashboard_file))
 
-        # --- Build RAG index ---
-        self.rag_index.build_index(
+        # --- Single sequential data stream ---
+        print("[LangevinRAG] Setting up data stream...")
+        stream = DataStream(
             tokenizer=self.tokenizer,
             seq_len=self.seq_len,
             dataset_name=self.dataset_name,
         )
 
-        # --- Build held-out set ---
-        print("[LangevinRAG] Building held-out evaluation set...")
+        # 1. Held-out set (first chunk from the stream)
+        pool_size = self.topic_pool_size if self.topic_coherent else self.held_out_total_size
+        print(f"[LangevinRAG] Consuming {pool_size} windows for held-out set...")
+        ho_tokens, ho_texts = stream.consume_windows(pool_size)
+        ho_data = torch.tensor(ho_tokens, dtype=torch.long)
         held_out = HeldOutSet(
-            tokenizer=self.tokenizer,
-            seq_len=self.seq_len,
-            total_size=self.held_out_total_size,
-            dataset_name=self.dataset_name,
+            pool_data=ho_data,
+            pool_texts=ho_texts,
             device=self.device,
             topic_coherent=self.topic_coherent,
-            topic_pool_size=self.topic_pool_size,
+            total_size=self.held_out_total_size if self.topic_coherent else None,
             topic_temperature=self.topic_temperature,
         )
+
+        # 2. RAG index (next chunk from the stream)
+        rag_size = self.rag_index.index_size
+        print(f"[LangevinRAG] Consuming {rag_size} windows for RAG index...")
+        rag_tokens, rag_texts = stream.consume_windows(rag_size)
+        self.rag_index.build_index(rag_tokens, rag_texts)
 
         # --- Topic similarity tracker ---
         topic_tracker = TopicSimilarityTracker(held_out, device=str(self.device))
@@ -1651,7 +1659,7 @@ class LangevinRAGTrainer:
             "sgld_snap_cosine_mean": langevin_info["snap_cosine_mean"],
             "sgld_embed_cosine_mean": langevin_info["embed_pairwise_cosine_mean"],
             "sgld_token_jaccard_mean": langevin_info["token_jaccard_mean"],
-            # Gumbel-Softmax sharpness (0 for legacy sampler)
+            # Softmax sharpness (0 for legacy sampler)
             "sgld_softmax_entropy": langevin_info.get("softmax_entropy_mean", 0.0),
             "sgld_softmax_max_prob": langevin_info.get("softmax_max_prob_mean", 0.0),
             "sgld_final_tau": langevin_info.get("final_tau", 0.0),
@@ -1707,9 +1715,10 @@ class LangevinRAGTrainer:
             retrieved_ids = retrieved_ids.to(self.device)
             rag_time = time.time() - t_rag
 
-            # --- Periodic RAG index refresh ---
+            # --- Periodic RAG index refresh (consume fresh data from the stream) ---
             if self.rag_refresh_interval > 0 and k % self.rag_refresh_interval == 0:
-                self.rag_index.refresh_index()
+                fresh_tokens, fresh_texts = stream.consume_windows(rag_size)
+                self.rag_index.refresh_index(fresh_tokens, fresh_texts)
 
             # --- 3. Q update for previous transition ---
             H_retrieved = extract_hidden_states(
@@ -1811,7 +1820,7 @@ class LangevinRAGTrainer:
                 "sgld_snap_cosine_mean": langevin_info["snap_cosine_mean"],
                 "sgld_embed_cosine_mean": langevin_info["embed_pairwise_cosine_mean"],
                 "sgld_token_jaccard_mean": langevin_info["token_jaccard_mean"],
-                # Gumbel-Softmax sharpness (0 for legacy sampler)
+                # Softmax sharpness (0 for legacy sampler)
                 "sgld_softmax_entropy": langevin_info.get("softmax_entropy_mean", 0.0),
                 "sgld_softmax_max_prob": langevin_info.get("softmax_max_prob_mean", 0.0),
                 "sgld_final_tau": langevin_info.get("final_tau", 0.0),

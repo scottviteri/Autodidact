@@ -204,17 +204,17 @@ The coefficient $\lambda_{\text{TD}}$ (\texttt{--td\_lambda}, default 1.0) contr
 
 \paragraph{Note on the bootstrap target.} Only the Q-prediction side $Q_\phi(h_{\text{prev}})$ carries gradients into $\theta$. The bootstrap target $y = (1-\gamma)\,r + \gamma\,V_{\bar{\phi}}(s')$ remains stop-gradient with respect to both $\phi$ and $\theta$, as is standard in Q-learning. The target-network value $V_{\bar{\phi}}$ uses detached hidden states.
 
-\section{Gumbel-Softmax Langevin-RAG Curriculum Selection}\label{sec:langevinrag}
+\section{Softmax-Relaxed Langevin-RAG Curriculum Selection}\label{sec:langevinrag}
 
 The discrete-Q approach (Section~\ref{sec:algorithm}) scores a fixed batch of $N$ candidates per step. This limits the search to the $N$ examples that happen to appear in the current batch---a tiny fraction of the training corpus. To search over a much larger space of possible training data, we introduce a pipeline that uses the Q-network as an energy function for continuous optimisation via Stochastic Gradient Langevin Dynamics (SGLD), then retrieves real training examples from a large indexed corpus via Retrieval-Augmented Generation (RAG).
 
-A na\"ive approach would run SGLD directly in the model's embedding space $\mathbb{R}^d$, then snap the resulting continuous vectors to discrete tokens via nearest-neighbor lookup. However, this suffers from a \emph{snap bottleneck}: Langevin dynamics pushes embeddings off the token manifold into regions of $\mathbb{R}^d$ that are far from any real token, so nearest-neighbor snapping destroys the information that SGLD optimised. Our solution is to run SGLD in \emph{logit space} over the vocabulary, using a softmax bridge to keep the transformer's input always in the convex hull of real token embeddings.
+A na\"ive approach would run SGLD directly in the model's embedding space $\mathbb{R}^d$, then snap the resulting continuous vectors to discrete tokens via nearest-neighbor lookup. However, this suffers from a \emph{snap bottleneck}: Langevin dynamics pushes embeddings off the token manifold into regions of $\mathbb{R}^d$ that are far from any real token, so nearest-neighbor snapping destroys the information that SGLD optimised. Our solution is to run SGLD in \emph{logit space} over the vocabulary, using a differentiable softmax bridge to keep the transformer's input always in the convex hull of real token embeddings. The gradient path from Q-value back through the transformer, through the softmax bridge, and into the logits is fully differentiable---no reparameterisation trick (e.g.\ Gumbel-Softmax) is needed, since we never backpropagate through a discrete sampling step.
 
 \subsection{Overview}
 
 The pipeline proceeds in four stages per training step:
 \begin{enumerate}[nosep]
-    \item \textbf{Gumbel-Softmax SGLD in logit space} (Section~\ref{sec:sgld}): Maintain $K$ parallel chains, each a tensor of logits $\boldsymbol{\lambda} \in \mathbb{R}^{L \times V}$ over the vocabulary at every token position. At each Langevin step, form soft token embeddings via $\text{softmax}(\boldsymbol{\lambda}/\tau_t) \cdot W_e$, feed through the transformer and Q-network, backpropagate $\partial Q / \partial \boldsymbol{\lambda}$, and apply the Langevin update. After burn-in, collect samples.
+    \item \textbf{Softmax-relaxed SGLD in logit space} (Section~\ref{sec:sgld}): Maintain $K$ parallel chains, each a tensor of logits $\boldsymbol{\lambda} \in \mathbb{R}^{L \times V}$ over the vocabulary at every token position. At each Langevin step, form soft token embeddings via $\text{softmax}(\boldsymbol{\lambda}/\tau_t) \cdot W_e$, feed through the transformer and Q-network, backpropagate $\partial Q / \partial \boldsymbol{\lambda}$, and apply the Langevin update. After all SGLD steps, collect one sample per chain.
     \item \textbf{Token extraction} (Section~\ref{sec:snap}): Extract discrete tokens via $\arg\max$ of the logits---no lossy nearest-neighbor snap.
     \item \textbf{RAG retrieval} (Section~\ref{sec:rag}): Embed the query sentences with a sentence-transformer and retrieve top-$k$ real training examples from a FAISS index.
     \item \textbf{LM training}: Train the language model on the retrieved examples (uniform or Q-weighted loss).
@@ -231,7 +231,7 @@ The key insight is that the softmax constraint $\text{softmax}(\boldsymbol{\lamb
     \boldsymbol{\pi}_i = \text{softmax}(\boldsymbol{\lambda}_i / \tau_t), \qquad
     \tilde{\mathbf{e}}_i = \sum_{v=1}^{V} \pi_{i,v}\, W_e[v] = \boldsymbol{\pi}_i^\top W_e,
 \end{equation}
-where $W_e \in \mathbb{R}^{V \times d}$ is the frozen token embedding matrix. The soft embedding $\tilde{\mathbf{e}}_i$ is a convex combination of real token embeddings, weighted by the softmax probabilities. When $\tau_t$ is large, $\boldsymbol{\pi}_i$ is diffuse and $\tilde{\mathbf{e}}_i$ is a broad average; when $\tau_t$ is small, $\boldsymbol{\pi}_i$ concentrates on one token and $\tilde{\mathbf{e}}_i \approx W_e[v^*]$ for the dominant token $v^*$.
+where $W_e \in \mathbb{R}^{V \times d}$ is the frozen token embedding matrix. This is a plain softmax---no Gumbel noise is added, because the gradient path $\boldsymbol{\lambda} \to \text{softmax} \to \tilde{\mathbf{e}} \to \text{transformer} \to Q$ is fully differentiable and we never need to backpropagate through a discrete sampling or argmax operation. The soft embedding $\tilde{\mathbf{e}}_i$ is a convex combination of real token embeddings, weighted by the softmax probabilities. When $\tau_t$ is large, $\boldsymbol{\pi}_i$ is diffuse and $\tilde{\mathbf{e}}_i$ is a broad average; when $\tau_t$ is small, $\boldsymbol{\pi}_i$ concentrates on one token and $\tilde{\mathbf{e}}_i \approx W_e[v^*]$ for the dominant token $v^*$.
 
 \paragraph{Energy function.} The energy is defined on the logits via the softmax bridge:
 \begin{equation}\label{eq:energy}
@@ -245,17 +245,19 @@ where $\text{transformer}(\tilde{\mathbf{e}})$ feeds the soft embeddings as \tex
 \end{equation}
 where $\varepsilon$ is the step size and $\sigma$ the noise scale. The gradient $\nabla_{\boldsymbol{\lambda}} E$ is computed by backpropagating from the Q-value through the Q-network, the transformer, the softmax bridge, and into the logits. Gradient checkpointing is used for the transformer blocks to keep memory bounded.
 
-\paragraph{Temperature annealing.} The softmax temperature $\tau_t$ is annealed linearly from $\tau_{\text{start}}$ (high, exploratory) to $\tau_{\text{end}}$ (low, sharp) over the Langevin steps:
+\paragraph{Temperature annealing.} The softmax temperature $\tau_t$ is annealed linearly from $\tau_{\text{start}}$ (high, exploratory) to $\tau_{\text{end}}$ (low, sharp) over the SGLD steps:
 \begin{equation}\label{eq:tau_anneal}
     \tau_t = \tau_{\text{start}} + \frac{t}{T_{\max} - 1}\,(\tau_{\text{end}} - \tau_{\text{start}}).
 \end{equation}
 This creates a natural coarse-to-fine search: early steps explore broadly (high $\tau$, soft distributions), while later steps refine toward specific tokens (low $\tau$, peaked distributions). The annealing schedule is analogous to simulated annealing, but applied to the softmax bridge rather than the SGLD noise.
 
+\paragraph{Non-stationarity.} Because $\tau_t$ changes the energy landscape at each step, the SGLD chain does not converge to a stationary Boltzmann distribution. The procedure is better understood as \emph{optimisation with injected noise} (gradient ascent on Q, regularised by Langevin noise for diversity) rather than as approximate posterior sampling. The noise prevents the chains from collapsing to a single mode, while the annealing schedule progressively sharpens the softmax so that the final logits represent well-defined token choices.
+
 \paragraph{Initialisation.} Each chain's logits are initialised as approximate one-hots: for each position, a random token is chosen uniformly from the vocabulary and assigned a high logit value (e.g.\ 10), with all other logits at 0. This ensures the initial soft embeddings are very close to real token embeddings, starting SGLD on the token manifold.
 
 \paragraph{Gradient clipping.} Per-chain gradient norms (flattened across all $L \times V$ logit entries) are clipped to a threshold $G$ for stability.
 
-\paragraph{Collection.} The first $B$ steps are discarded as burn-in. After burn-in, every $T$-th sample is collected (thinning). Collection stops once $S$ samples have been gathered.
+\paragraph{Collection.} All $T_{\max}$ SGLD steps run to completion, then the final logits from each of the $K$ chains are collected, yielding $K$ samples (one per chain). The number of SGLD steps serves as a burn-in period: enough steps for the chains to climb the Q-landscape and for the softmax temperature to anneal to $\tau_{\text{end}}$.
 
 \subsection{Token Extraction}\label{sec:snap}
 
@@ -273,26 +275,24 @@ Unlike the legacy approach (nearest-neighbor cosine similarity in $\mathbb{R}^d$
 
 \paragraph{Query and retrieval (each step).} The $S$ discrete query sequences from the token extraction step are decoded to text and embedded with the same sentence-transformer. For each query, the top-$k$ nearest neighbours in the FAISS index are retrieved by cosine similarity. Results are deduplicated across all queries to produce $R \leq S \cdot k$ unique training examples.
 
-\subsection{Gumbel-Softmax Langevin-RAG Algorithm}\label{sec:langevin_algorithm}
+\subsection{Softmax-Relaxed Langevin-RAG Algorithm}\label{sec:langevin_algorithm}
 
 \begin{algorithm}[h]
-\caption{Curriculum Selection via Gumbel-Softmax Langevin-RAG}
+\caption{Curriculum Selection via Softmax-Relaxed Langevin-RAG}
 \begin{algorithmic}[1]
 \State \textbf{Initialise:} LM parameters $\theta$; Q-network $\phi$; target $\bar{\phi} \gets \phi$; FAISS index over $I$ corpus windows
 \Statex
 \For{$k = 0, 1, 2, \ldots$}
     \Statex
-    \State \textcolor{gray}{\textit{// Stage 1: Gumbel-Softmax SGLD in logit space}}
+    \State \textcolor{gray}{\textit{// Stage 1: Softmax-relaxed SGLD in logit space}}
     \State Initialise $K$ chains: $\boldsymbol{\lambda}^{(j)}_0 \gets \text{one-hot-logits}(\text{random tokens}),\; j = 1, \ldots, K$
-    \For{$t = 0, 1, \ldots, T_{\max}$}
+    \For{$t = 0, 1, \ldots, T_{\max}-1$}
         \State $\tau_t \gets \tau_{\text{start}} + \frac{t}{T_{\max}-1}(\tau_{\text{end}} - \tau_{\text{start}})$ \Comment{Anneal softmax temperature}
         \State $\tilde{\mathbf{e}}^{(j)} \gets \text{softmax}(\boldsymbol{\lambda}^{(j)}_t / \tau_t) \cdot W_e$ \Comment{Soft token embeddings, Eq.~\eqref{eq:softmax_bridge}}
         \State $Q^{(j)} \gets Q_\phi(\text{transformer}(\tilde{\mathbf{e}}^{(j)}))$ \Comment{Energy via Eq.~\eqref{eq:energy}}
         \State $\boldsymbol{\lambda}^{(j)}_{t+1} \gets \boldsymbol{\lambda}^{(j)}_t + \frac{\varepsilon}{2}\, \text{clip}\bigl(\nabla_{\boldsymbol{\lambda}} E,\, G\bigr) + \sqrt{\varepsilon}\;\boldsymbol{\eta}_t$ \Comment{Langevin update, Eq.~\eqref{eq:langevin}}
-        \If{$t \geq B$ and $(t - B) \bmod T = 0$}
-            \State Collect $\boldsymbol{\lambda}^{(1)}_t, \ldots, \boldsymbol{\lambda}^{(K)}_t$
-        \EndIf
     \EndFor
+    \State Collect final logits $\boldsymbol{\lambda}^{(1)}_{T_{\max}}, \ldots, \boldsymbol{\lambda}^{(K)}_{T_{\max}}$ \Comment{One sample per chain}
     \Statex
     \State \textcolor{gray}{\textit{// Stage 2: Token extraction (argmax --- no snap)}}
     \State For each collected $\boldsymbol{\lambda}$, compute $t_i = \arg\max_v \lambda_{i,v}$ via Eq.~\eqref{eq:snap}
@@ -316,7 +316,7 @@ Unlike the legacy approach (nearest-neighbor cosine similarity in $\mathbb{R}^d$
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Why logit-space SGLD avoids the snap bottleneck.} In the legacy embedding-space approach, Langevin dynamics in $\mathbb{R}^d$ per position pushes embeddings into regions far from any token (snap cosine similarity $\approx 0.22$, barely above the random baseline of $0.17$), and nearest-neighbor snapping destroys the optimised information. In the Gumbel-Softmax approach, the softmax constraint ensures the transformer's input is always a convex combination of real token embeddings. The Q-network's gradients flow through the softmax into the logits, directly shaping which tokens are favoured. As $\tau_t$ decreases, the softmax sharpens and the dominant token emerges naturally---$\arg\max$ simply reads it off.
+\paragraph{Why logit-space SGLD avoids the snap bottleneck.} In the legacy embedding-space approach, Langevin dynamics in $\mathbb{R}^d$ per position pushes embeddings into regions far from any token (snap cosine similarity $\approx 0.22$, barely above the random baseline of $0.17$), and nearest-neighbor snapping destroys the optimised information. In the softmax-relaxed approach, the softmax constraint ensures the transformer's input is always a convex combination of real token embeddings. The Q-network's gradients flow through the softmax into the logits, directly shaping which tokens are favoured. As $\tau_t$ decreases, the softmax sharpens and the dominant token emerges naturally---$\arg\max$ simply reads it off.
 
 \paragraph{LM training (uniform or Q-weighted).} The LM can train on retrieved examples with either \emph{uniform} loss ($w_i = 1/R$) or \emph{Q-weighted} loss ($w_i = \text{softmax}(Q(h_i)/\beta)$). In the uniform case, the curriculum signal is entirely in \emph{which} examples are retrieved. In the Q-weighted case, examples the Q-network considers more valuable receive a larger share of the gradient, combining selection and weighting.
 
@@ -339,7 +339,7 @@ Monitoring SGLD health is critical for tuning the Langevin hyperparameters. We t
 
 \subsection{Interpretation as Free-Energy Minimisation}\label{sec:freeenergy}
 
-The Boltzmann policy is the solution to a free-energy minimisation problem at each state:
+Both the discrete-Q and Langevin-RAG pipelines can be understood through a unified free-energy lens. In the discrete-Q mode, the Boltzmann policy over a finite candidate set $C_k$ is the exact solution to a free-energy minimisation problem at each state:
 \begin{equation}
     \pi^*(\cdot \mid s) = \arg\min_\pi \;\Bigl[\; -\mathbb{E}_{x \sim \pi}\bigl[Q_\phi(s, x)\bigr] + \beta\, \mathrm{KL}\bigl(\pi \,\|\, p_0\bigr) \;\Bigr],
 \end{equation}
@@ -348,6 +348,8 @@ where $p_0$ is the uniform distribution over $C_k$. Since $p_0$ is uniform, $\ma
     \pi^*(\cdot \mid s) = \arg\min_\pi \;\Bigl[\; -\mathbb{E}_{x \sim \pi}\bigl[Q_\phi(s, x)\bigr] - \beta\, H(\pi) \;\Bigr].
 \end{equation}
 The first term encourages selecting high-value candidates; the second encourages exploration. The temperature $\beta$ controls the tradeoff.
+
+In the Langevin-RAG mode, SGLD approximately samples from the Boltzmann distribution $p(\boldsymbol{\lambda}) \propto \exp(E(\boldsymbol{\lambda}))$ over the continuous logit space. The Langevin noise plays the role of the entropy term---it prevents the chains from collapsing to a single mode, maintaining diversity among the $K$ samples. However, because the softmax temperature $\tau_t$ is annealed during the run, the energy landscape is non-stationary and the chain does not converge to a fixed Boltzmann distribution. In practice the procedure functions as Q-guided optimisation with noise-injected diversity, rather than as exact posterior sampling.
 
 \paragraph{ELBO interpretation.} Define a latent variable model where the ``evidence'' is the event that the current trajectory is optimal, with likelihood $p(\text{optimal} \mid x) \propto \exp(Q(s, x)/\beta)$. The policy $\pi$ acts as a variational posterior over actions, and the free energy is the negative ELBO:
 \begin{equation}
