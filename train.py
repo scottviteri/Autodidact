@@ -152,9 +152,9 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--rag_sample_temperature", type=float,
                         default=_defaults.rag_sample_temperature,
                         help="Temperature for softmax sampling over top-k RAG scores")
-    parser.add_argument("--rag_refresh_interval", type=int,
-                        default=_defaults.rag_refresh_interval,
-                        help="Rebuild RAG index with fresh data every N steps (0=never)")
+    parser.add_argument("--rag_ingest_per_step", type=int,
+                        default=_defaults.rag_ingest_per_step,
+                        help="Rolling refresh: fresh windows consumed per step into RAG ring buffer (0=static index)")
 
     # Q-head warmup
     parser.add_argument("--q_warmup_steps", type=int, default=_defaults.q_warmup_steps,
@@ -259,7 +259,7 @@ def main():
             rag_top_k=config.rag_top_k,
             rag_sample_from_topk=config.rag_sample_from_topk,
             rag_sample_temperature=config.rag_sample_temperature,
-            rag_refresh_interval=config.rag_refresh_interval,
+            rag_ingest_per_step=config.rag_ingest_per_step,
             log_interval=config.log_interval,
             eval_interval=config.eval_interval,
             dashboard_interval=config.dashboard_interval,

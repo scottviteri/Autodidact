@@ -146,4 +146,9 @@ class AutodidactConfig:
     rag_top_k: int = 16              # FAISS candidates per query (scored, then sampled)
     rag_sample_from_topk: bool = True # Softmax-sample 1 from top-k per query (vs deterministic top-1)
     rag_sample_temperature: float = 0.1  # Temperature for softmax sampling over top-k scores
-    rag_refresh_interval: int = 500   # Rebuild RAG index with fresh data every N steps (0=never)
+    rag_ingest_per_step: int = 100    # Rolling refresh: fresh windows consumed per step (0=static index)
+                                      # The index is a ring buffer; each step, this many new windows are
+                                      # encoded, written over the oldest entries, and the FAISS index is
+                                      # rebuilt. Default 100 = same throughput as the old bulk refresh
+                                      # (50000 windows / 500 steps) but spread smoothly to avoid the
+                                      # LM loss jump from sudden distribution shifts.

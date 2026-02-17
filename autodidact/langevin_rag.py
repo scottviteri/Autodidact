@@ -688,7 +688,13 @@ class RAGIndex:
     Uses sentence-transformers (all-MiniLM-L6-v2 by default) for encoding.
     The index is built from pre-consumed data (provided by the caller, typically
     a DataStream), then queried each step with the Langevin-generated query
-    sentences.  Refreshes are also driven by the caller passing in fresh data.
+    sentences.
+
+    The index is maintained as a **ring buffer**: fresh windows are continuously
+    ingested via ingest(), overwriting the oldest entries. The FAISS index is
+    rebuilt after each ingest (IndexFlatIP rebuild for 50K vectors is <5ms).
+    This "rolling refresh" avoids the LM loss jumps caused by atomically
+    replacing the entire index, while keeping the data fresh.
     """
 
     def __init__(
@@ -711,14 +717,21 @@ class RAGIndex:
         self.embed_dim = self.embed_model.get_sentence_embedding_dimension()
         print(f"[RAG] Embedding dimension: {self.embed_dim}")
 
-        # Will be populated by build_index()
-        self.index = None               # FAISS index
-        self.stored_token_ids = None     # [index_size, seq_len] token IDs
-        self.stored_texts = None         # list of decoded text strings
+        # Ring buffer state (initialized by build_index)
+        self._embeddings = None          # np.ndarray [index_size, embed_dim]
+        self._token_ids = None           # torch.Tensor [index_size, seq_len]
+        self._texts = None               # list of str, length index_size
+        self._write_head = 0             # next ring buffer position to overwrite
+        self._ingested_since_build = 0   # windows ingested via ingest() since build
+
+        # Public aliases (used by trainer warmup + retrieve)
+        self.index = None                # FAISS index
+        self.stored_token_ids = None     # alias to _token_ids
+        self.stored_texts = None         # alias to _texts
 
     def build_index(self, windows_tokens: list, windows_text: list):
         """
-        Build a FAISS index from pre-consumed token windows.
+        Build the initial FAISS index and initialize the ring buffer.
 
         Args:
             windows_tokens: list of token lists, each of length seq_len.
@@ -729,28 +742,41 @@ class RAGIndex:
         n = len(windows_tokens)
         print(f"[RAG] Building index from {n} pre-consumed windows. Embedding...")
 
-        all_embeddings = self.embed_model.encode(
+        self._embeddings = self.embed_model.encode(
             windows_text,
             batch_size=self.embed_batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
             normalize_embeddings=True,
-        )  # [n, embed_dim]
+        ).copy()  # [n, embed_dim] — .copy() ensures a writable, contiguous array
 
         self.index = faiss.IndexFlatIP(self.embed_dim)
-        self.index.add(all_embeddings.astype(np.float32))
+        self.index.add(self._embeddings.astype(np.float32))
 
-        self.stored_token_ids = torch.tensor(windows_tokens, dtype=torch.long)  # [n, seq_len]
-        self.stored_texts = windows_text
+        self._token_ids = torch.tensor(windows_tokens, dtype=torch.long)  # [n, seq_len]
+        self._texts = list(windows_text)
+        self._write_head = 0
+        self._ingested_since_build = 0
+
+        # Public aliases (these point to the ring buffer objects, so in-place
+        # modifications by ingest() are visible through the alias)
+        self.stored_token_ids = self._token_ids
+        self.stored_texts = self._texts
 
         print(f"[RAG] Index built: {self.index.ntotal} vectors, dim={self.embed_dim}")
 
-    def refresh_index(self, windows_tokens: list, windows_text: list):
+    def ingest(self, windows_tokens: list, windows_text: list):
         """
-        Replace the entire FAISS index with fresh pre-consumed data.
+        Ingest fresh windows into the ring buffer, overwriting the oldest
+        entries, and rebuild the FAISS index.
 
-        The caller (trainer) is responsible for consuming the data from
-        the shared DataStream before calling this method.
+        This implements rolling refresh: instead of replacing the entire
+        index at once (causing LM loss jumps from distribution shift),
+        a small batch of fresh windows is cycled in each step. The ring
+        buffer guarantees the index always stays at full capacity.
+
+        Rebuilding IndexFlatIP from 50K pre-computed embeddings is <5ms
+        (just a memcpy), so it's done after every ingest call.
 
         Args:
             windows_tokens: list of token lists, each of length seq_len.
@@ -759,21 +785,63 @@ class RAGIndex:
         import faiss
 
         n = len(windows_tokens)
-        all_embeddings = self.embed_model.encode(
+        if n == 0:
+            return
+
+        # Encode new windows with sentence-transformer
+        new_embeddings = self.embed_model.encode(
             windows_text,
             batch_size=self.embed_batch_size,
-            show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True,
-        )
+            show_progress_bar=False,
+        )  # [n, embed_dim]
 
+        new_token_ids = torch.tensor(windows_tokens, dtype=torch.long)
+
+        buf_size = self._embeddings.shape[0]
+        start = self._write_head
+
+        if start + n <= buf_size:
+            # No wrap-around
+            self._embeddings[start:start + n] = new_embeddings
+            self._token_ids[start:start + n] = new_token_ids
+            for i in range(n):
+                self._texts[start + i] = windows_text[i]
+        else:
+            # Wrap-around: split into two parts
+            first = buf_size - start
+            second = n - first
+
+            self._embeddings[start:] = new_embeddings[:first]
+            self._embeddings[:second] = new_embeddings[first:]
+
+            self._token_ids[start:] = new_token_ids[:first]
+            self._token_ids[:second] = new_token_ids[first:]
+
+            for i in range(first):
+                self._texts[start + i] = windows_text[i]
+            for i in range(second):
+                self._texts[i] = windows_text[first + i]
+
+        self._write_head = (start + n) % buf_size
+        self._ingested_since_build += n
+
+        # Rebuild FAISS index from current ring buffer
         self.index = faiss.IndexFlatIP(self.embed_dim)
-        self.index.add(all_embeddings.astype(np.float32))
+        self.index.add(self._embeddings.astype(np.float32))
 
-        self.stored_token_ids = torch.tensor(windows_tokens, dtype=torch.long)
-        self.stored_texts = windows_text
+    @property
+    def turnover_fraction(self) -> float:
+        """Fraction of the ring buffer replaced since initial build_index().
 
-        print(f"[RAG refresh] Index replaced: {n} fresh windows")
+        Returns 0.0 before any ingest() calls. Reaches 1.0 after ingesting
+        index_size windows (i.e., every original entry has been overwritten
+        at least once). Can exceed 1.0 for multiple full turnovers.
+        """
+        if self._embeddings is None:
+            return 0.0
+        return self._ingested_since_build / self._embeddings.shape[0]
 
     def retrieve(
         self,

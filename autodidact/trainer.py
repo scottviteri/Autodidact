@@ -936,7 +936,7 @@ class LangevinRAGTrainer:
         rag_top_k: int = 16,
         rag_sample_from_topk: bool = True,
         rag_sample_temperature: float = 0.1,
-        rag_refresh_interval: int = 500,
+        rag_ingest_per_step: int = 100,
         # Logging
         log_interval: int = 10,
         eval_interval: int = 100,
@@ -1018,7 +1018,7 @@ class LangevinRAGTrainer:
         # --- RAG retrieval params ---
         self.rag_sample_from_topk = rag_sample_from_topk
         self.rag_sample_temperature = rag_sample_temperature
-        self.rag_refresh_interval = rag_refresh_interval
+        self.rag_ingest_per_step = rag_ingest_per_step
 
         # --- Reset LM each step (ablation: only Q learns across steps) ---
         self.reset_lm_each_step = reset_lm_each_step
@@ -1126,7 +1126,7 @@ class LangevinRAGTrainer:
             "rag_top_k": rag_top_k,
             "rag_sample_from_topk": rag_sample_from_topk,
             "rag_sample_temperature": rag_sample_temperature,
-            "rag_refresh_interval": rag_refresh_interval,
+            "rag_ingest_per_step": rag_ingest_per_step,
             "reset_lm_each_step": reset_lm_each_step,
             "q_warmup_steps": q_warmup_steps,
             "td_into_theta": td_into_theta,
@@ -1715,10 +1715,10 @@ class LangevinRAGTrainer:
             retrieved_ids = retrieved_ids.to(self.device)
             rag_time = time.time() - t_rag
 
-            # --- Periodic RAG index refresh (consume fresh data from the stream) ---
-            if self.rag_refresh_interval > 0 and k % self.rag_refresh_interval == 0:
-                fresh_tokens, fresh_texts = stream.consume_windows(rag_size)
-                self.rag_index.refresh_index(fresh_tokens, fresh_texts)
+            # --- Rolling RAG index refresh (ingest fresh windows each step) ---
+            if self.rag_ingest_per_step > 0:
+                fresh_tokens, fresh_texts = stream.consume_windows(self.rag_ingest_per_step)
+                self.rag_index.ingest(fresh_tokens, fresh_texts)
 
             # --- 3. Q update for previous transition ---
             H_retrieved = extract_hidden_states(
@@ -1835,6 +1835,8 @@ class LangevinRAGTrainer:
                 "step_time": step_time,
                 # GPU memory
                 "gpu_peak_mem_gb": gpu_mem_gb,
+                # RAG index turnover (rolling refresh)
+                "rag_turnover": self.rag_index.turnover_fraction,
             }
             if self.td_into_theta:
                 metrics["lm_td_grad_norm"] = lm_td_grad_norm
