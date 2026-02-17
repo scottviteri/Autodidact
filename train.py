@@ -93,10 +93,8 @@ def parse_args() -> AutodidactConfig:
     # Mixture training
     parser.add_argument("--mixture_batch_size", type=int, default=_defaults.mixture_batch_size,
                         help="Mini-batch size for gradient-accumulated mixture training")
-    parser.add_argument("--no_q_weighting", action="store_true", default=True,
-                        help="Use uniform weights instead of Q-derived Boltzmann weights for LM loss (default)")
-    parser.add_argument("--q_weighting", dest="no_q_weighting", action="store_false",
-                        help="Weight LM loss by pi=softmax(Q/beta); applies to both discrete-Q and Langevin-RAG")
+    parser.add_argument("--no_q_weighting", action="store_true", default=False,
+                        help="Use uniform weights instead of Q-derived Boltzmann weights for LM loss")
     parser.add_argument("--reset_lm_each_step", action="store_true",
                         help="Reset LM weights to initial theta after each step; only Q-network learns across steps")
 
@@ -118,15 +116,9 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--langevin_seq_len", type=int, default=_defaults.langevin_seq_len,
                         help="Sequence length for Langevin embedding optimization")
     parser.add_argument("--langevin_num_chains", type=int, default=_defaults.langevin_num_chains,
-                        help="K: parallel Langevin chains")
-    parser.add_argument("--langevin_num_samples", type=int, default=_defaults.langevin_num_samples,
-                        help="Total samples to collect from Langevin dynamics")
-    parser.add_argument("--langevin_steps", type=int, default=_defaults.langevin_steps,
-                        help="Total Langevin steps (burn-in + collection)")
+                        help="K: parallel Langevin chains (= number of output query samples)")
     parser.add_argument("--langevin_burn_in", type=int, default=_defaults.langevin_burn_in,
-                        help="Discard first N Langevin steps")
-    parser.add_argument("--langevin_thin", type=int, default=_defaults.langevin_thin,
-                        help="Keep every N-th sample after burn-in")
+                        help="Number of Langevin steps before collecting (one sample per chain)")
     parser.add_argument("--langevin_step_size", type=float, default=_defaults.langevin_step_size,
                         help="Langevin step size epsilon")
     parser.add_argument("--langevin_temperature", type=float, default=_defaults.langevin_temperature,
@@ -151,7 +143,18 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--rag_index_size", type=int, default=_defaults.rag_index_size,
                         help="Number of dataset windows to index for RAG")
     parser.add_argument("--rag_top_k", type=int, default=_defaults.rag_top_k,
-                        help="Number of examples to retrieve per query")
+                        help="FAISS candidates per query (scored, then sampled or top-1)")
+    parser.add_argument("--rag_sample_from_topk", action="store_true",
+                        default=_defaults.rag_sample_from_topk,
+                        help="Softmax-sample 1 from top-k per query for diversity (default)")
+    parser.add_argument("--no_rag_sample", dest="rag_sample_from_topk", action="store_false",
+                        help="Deterministic top-1 retrieval (no sampling)")
+    parser.add_argument("--rag_sample_temperature", type=float,
+                        default=_defaults.rag_sample_temperature,
+                        help="Temperature for softmax sampling over top-k RAG scores")
+    parser.add_argument("--rag_refresh_interval", type=int,
+                        default=_defaults.rag_refresh_interval,
+                        help="Rebuild RAG index with fresh data every N steps (0=never)")
 
     # Q-head warmup
     parser.add_argument("--q_warmup_steps", type=int, default=_defaults.q_warmup_steps,
@@ -241,10 +244,7 @@ def main():
             grad_clip=config.grad_clip,
             langevin_seq_len=config.langevin_seq_len,
             langevin_num_chains=config.langevin_num_chains,
-            langevin_num_samples=config.langevin_num_samples,
-            langevin_steps=config.langevin_steps,
             langevin_burn_in=config.langevin_burn_in,
-            langevin_thin=config.langevin_thin,
             langevin_step_size=config.langevin_step_size,
             langevin_temperature=config.langevin_temperature,
             langevin_noise_scale=config.langevin_noise_scale,
@@ -257,6 +257,9 @@ def main():
             rag_embedding_model=config.rag_embedding_model,
             rag_index_size=config.rag_index_size,
             rag_top_k=config.rag_top_k,
+            rag_sample_from_topk=config.rag_sample_from_topk,
+            rag_sample_temperature=config.rag_sample_temperature,
+            rag_refresh_interval=config.rag_refresh_interval,
             log_interval=config.log_interval,
             eval_interval=config.eval_interval,
             dashboard_interval=config.dashboard_interval,

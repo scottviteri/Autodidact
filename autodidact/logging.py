@@ -340,7 +340,9 @@ class LangevinRAGDashboard:
                 if len(best_r_sims) >= 20:
                     ax.plot(sim_steps[19:len(best_r_sims)], _smooth(best_r_sims, 20), color="green", linewidth=1.8, label="Best retrieved")
             if mean_r_sims:
-                ax.plot(sim_steps[:len(mean_r_sims)], mean_r_sims, color="gray", alpha=0.5, linewidth=0.8, label="Mean retrieved")
+                ax.plot(sim_steps[:len(mean_r_sims)], mean_r_sims, color="blue", alpha=0.4, linewidth=0.5)
+                if len(mean_r_sims) >= 20:
+                    ax.plot(sim_steps[19:len(mean_r_sims)], _smooth(mean_r_sims, 20), color="blue", linewidth=2.2, label="Mean retrieved")
             ax.set_ylim(-0.1, 1.05)
             ax.legend(fontsize=6, loc="best")
 
@@ -418,9 +420,11 @@ class LangevinRAGDashboard:
             ax = axes[3][1]
             _plot_line(ax, metrics, "num_retrieved", c, method, alpha=0.6, smooth_alpha=1.0, window=1)
 
-            # (3,2) Token Jaccard Similarity (lower = more diverse)
+            # (3,2) Softmax Logit Entropy (lower = sharper token selection)
             ax = axes[3][2]
-            _plot_line(ax, metrics, "sgld_token_jaccard_mean", c, method)
+            _plot_line(ax, metrics, "sgld_softmax_entropy", c, method)
+            # Reference: uniform entropy = log(V) ≈ 10.8
+            ax.axhline(y=math.log(50257), color="gray", linestyle=":", alpha=0.5, linewidth=1.0)
 
             # (3,3) SGLD Q Best
             ax = axes[3][3]
@@ -475,7 +479,7 @@ class LangevinRAGDashboard:
             # Row 3
             "SGLD Grad Norm", "Grad Clip Fraction", "Embed Cosine Sim (lower=diverse)", "SGLD Snap Cosine Sim",
             # Row 4
-            "RAG Top-1 Score", "Num Retrieved", "Token Jaccard (lower=diverse)", "SGLD Best Q",
+            "RAG Top-1 Score", "Unique Retrieved (after dedup)", "Softmax Entropy (lower=sharper)", "SGLD Best Q",
             # Row 5
             "Time Breakdown (s)", "Step Time (s)", "GPU Peak Memory (GB)", "LM / Q Grad Norms",
         ]

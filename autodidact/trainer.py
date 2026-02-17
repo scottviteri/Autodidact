@@ -917,10 +917,7 @@ class LangevinRAGTrainer:
         # Langevin dynamics
         langevin_seq_len: int = 128,
         langevin_num_chains: int = 8,
-        langevin_num_samples: int = 8,
-        langevin_steps: int = 100,
         langevin_burn_in: int = 50,
-        langevin_thin: int = 5,
         langevin_step_size: float = 0.01,
         langevin_temperature: float = 1.0,
         langevin_noise_scale: float = 1.0,
@@ -936,7 +933,10 @@ class LangevinRAGTrainer:
         # RAG
         rag_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         rag_index_size: int = 50000,
-        rag_top_k: int = 8,
+        rag_top_k: int = 16,
+        rag_sample_from_topk: bool = True,
+        rag_sample_temperature: float = 0.1,
+        rag_refresh_interval: int = 500,
         # Logging
         log_interval: int = 10,
         eval_interval: int = 100,
@@ -1015,6 +1015,11 @@ class LangevinRAGTrainer:
         # --- LM micro-batch size ---
         self.lm_micro_batch_size = lm_micro_batch_size
 
+        # --- RAG retrieval params ---
+        self.rag_sample_from_topk = rag_sample_from_topk
+        self.rag_sample_temperature = rag_sample_temperature
+        self.rag_refresh_interval = rag_refresh_interval
+
         # --- Reset LM each step (ablation: only Q learns across steps) ---
         self.reset_lm_each_step = reset_lm_each_step
 
@@ -1046,10 +1051,7 @@ class LangevinRAGTrainer:
             q_net=self.q_net,
             seq_len=langevin_seq_len,
             num_chains=langevin_num_chains,
-            num_samples=langevin_num_samples,
-            langevin_steps=langevin_steps,
             burn_in=langevin_burn_in,
-            thin=langevin_thin,
             step_size=langevin_step_size,
             temperature=langevin_temperature,
             noise_scale=langevin_noise_scale,
@@ -1111,10 +1113,7 @@ class LangevinRAGTrainer:
             "grad_clip": grad_clip,
             "langevin_seq_len": langevin_seq_len,
             "langevin_num_chains": langevin_num_chains,
-            "langevin_num_samples": langevin_num_samples,
-            "langevin_steps": langevin_steps,
             "langevin_burn_in": langevin_burn_in,
-            "langevin_thin": langevin_thin,
             "langevin_step_size": langevin_step_size,
             "langevin_temperature": langevin_temperature,
             "langevin_batch_size": langevin_batch_size,
@@ -1125,6 +1124,9 @@ class LangevinRAGTrainer:
             "rag_embedding_model": rag_embedding_model,
             "rag_index_size": rag_index_size,
             "rag_top_k": rag_top_k,
+            "rag_sample_from_topk": rag_sample_from_topk,
+            "rag_sample_temperature": rag_sample_temperature,
+            "rag_refresh_interval": rag_refresh_interval,
             "reset_lm_each_step": reset_lm_each_step,
             "q_warmup_steps": q_warmup_steps,
             "td_into_theta": td_into_theta,
@@ -1264,18 +1266,24 @@ class LangevinRAGTrainer:
         valuable receive a larger share of the gradient.
 
         Uses gradient accumulation over micro-batches to control memory.
+        The micro-batch size is capped at 8 because this method materialises
+        the full [bs, seq_len-1, vocab_size] logits tensor to compute
+        per-example losses (unlike the unweighted path which uses HF's
+        fused loss). With seq_len=512 and vocab=50k, each example needs
+        ~100 MB of logits, so bs=8 uses ~0.8 GB (safe on H100).
 
         Args:
             batch_ids: [B, seq_len] token IDs of retrieved examples.
             weights: [B] Boltzmann policy weights (should sum to 1).
             micro_batch_size: Number of examples per micro-batch forward pass.
-                              Defaults to self.lm_micro_batch_size.
+                              Defaults to min(self.lm_micro_batch_size, 8).
 
         Returns:
             (weighted_loss_value, grad_norm)
         """
         if micro_batch_size is None:
-            micro_batch_size = self.lm_micro_batch_size
+            # Cap at 8 because per-example loss requires [bs, seq_len, vocab]
+            micro_batch_size = min(self.lm_micro_batch_size, 8)
         self.lm_optimizer.zero_grad()
         B = batch_ids.shape[0]
         weighted_loss_total = 0.0
@@ -1570,7 +1578,9 @@ class LangevinRAGTrainer:
         # RAG retrieval -> real training examples
         t_rag = time.time()
         retrieved_ids, rag_info = self.rag_index.retrieve(
-            query_ids, self.tokenizer
+            query_ids, self.tokenizer,
+            sample_from_topk=self.rag_sample_from_topk,
+            sample_temperature=self.rag_sample_temperature,
         )
         retrieved_ids = retrieved_ids.to(self.device)
         rag_time = time.time() - t_rag
@@ -1690,10 +1700,16 @@ class LangevinRAGTrainer:
             # --- 2. RAG retrieval -> real training examples ---
             t_rag = time.time()
             retrieved_ids, rag_info = self.rag_index.retrieve(
-                query_ids, self.tokenizer
+                query_ids, self.tokenizer,
+                sample_from_topk=self.rag_sample_from_topk,
+                sample_temperature=self.rag_sample_temperature,
             )
             retrieved_ids = retrieved_ids.to(self.device)
             rag_time = time.time() - t_rag
+
+            # --- Periodic RAG index refresh ---
+            if self.rag_refresh_interval > 0 and k % self.rag_refresh_interval == 0:
+                self.rag_index.refresh_index()
 
             # --- 3. Q update for previous transition ---
             H_retrieved = extract_hidden_states(

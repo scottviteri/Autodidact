@@ -85,9 +85,11 @@ class AutodidactConfig:
 
     # --- Mixture training ---
     mixture_batch_size: int = 8      # Mini-batch size for gradient-accumulated mixture training
-    no_q_weighting: bool = True      # Use uniform weights instead of Q-derived Boltzmann weights for LM loss
-                                     # Applies to both discrete-Q mode (mixture) and Langevin-RAG mode (retrieved batch).
-                                     # When False, weights are pi = softmax(Q/beta).
+    no_q_weighting: bool = False     # When False (default), weight LM loss by pi = softmax(Q/beta).
+                                     # This is the expected gradient under the optimal soft policy,
+                                     # giving the Q-network's long-horizon preferences influence over
+                                     # gradient magnitude, not just data selection.
+                                     # When True, use uniform weights (1/R or 1/N).
 
     # --- Ablation: reset LM each step ---
     reset_lm_each_step: bool = False  # Reset LM weights to initial theta after each step (only Q learns)
@@ -128,11 +130,8 @@ class AutodidactConfig:
     langevin_rag: bool = True         # Use Langevin Q-guided search + RAG retrieval
     sampler_type: str = "gumbel"      # "gumbel" (Gumbel-Softmax, default) or "embedding" (legacy)
     langevin_seq_len: int = 64        # Sequence length for Langevin optimization
-    langevin_num_chains: int = 64     # K: parallel Langevin chains
-    langevin_num_samples: int = 64    # Total samples to collect from Langevin
-    langevin_steps: int = 50          # Total Langevin steps (burn-in + collection)
-    langevin_burn_in: int = 40        # Discard first N steps
-    langevin_thin: int = 10           # Keep every N-th sample after burn-in
+    langevin_num_chains: int = 64     # K: parallel chains = K output samples (one per chain)
+    langevin_burn_in: int = 40        # Number of Langevin steps before collecting
     langevin_step_size: float = 0.01  # Langevin step size epsilon
     langevin_temperature: float = 1.0 # SGLD energy temperature (scales Q in energy)
     langevin_noise_scale: float = 1.0 # Multiplier on Gaussian noise term
@@ -144,4 +143,7 @@ class AutodidactConfig:
     lm_micro_batch_size: int = 64     # Micro-batch size for gradient-accumulated LM training
     rag_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     rag_index_size: int = 50000       # Number of dataset windows to index
-    rag_top_k: int = 4                # Retrieved examples per query
+    rag_top_k: int = 16              # FAISS candidates per query (scored, then sampled)
+    rag_sample_from_topk: bool = True # Softmax-sample 1 from top-k per query (vs deterministic top-1)
+    rag_sample_temperature: float = 0.1  # Temperature for softmax sampling over top-k scores
+    rag_refresh_interval: int = 500   # Rebuild RAG index with fresh data every N steps (0=never)

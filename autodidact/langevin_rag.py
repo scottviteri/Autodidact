@@ -77,11 +77,8 @@ class GumbelSoftmaxQSampler:
         model,                          # GPT2LMHeadModel
         q_net: QNetwork,                # Q-network (online, not target)
         seq_len: int = 64,
-        num_chains: int = 64,           # K parallel chains
-        num_samples: int = 64,          # total samples to collect
-        langevin_steps: int = 50,       # total Langevin steps (burn-in + collection)
-        burn_in: int = 40,              # discard first burn_in steps
-        thin: int = 10,                 # keep every thin-th sample after burn-in
+        num_chains: int = 64,           # K parallel chains = K output samples
+        burn_in: int = 40,              # number of Langevin steps before collecting
         step_size: float = 0.01,        # Langevin step size epsilon
         temperature: float = 1.0,       # SGLD energy temperature (scales Q in energy)
         noise_scale: float = 1.0,       # multiplier on the Gaussian noise term
@@ -96,10 +93,7 @@ class GumbelSoftmaxQSampler:
         self.q_net = q_net
         self.seq_len = seq_len
         self.num_chains = num_chains
-        self.num_samples = num_samples
-        self.langevin_steps = langevin_steps
         self.burn_in = burn_in
-        self.thin = thin
         self.step_size = step_size
         self.temperature = temperature
         self.noise_scale = noise_scale
@@ -267,11 +261,12 @@ class GumbelSoftmaxQSampler:
         # Temperature annealing schedule (linear from tau_start to tau_end)
         tau_start = self.gumbel_tau_start
         tau_end = self.gumbel_tau_end
+        n_steps = self.burn_in
 
         def _get_tau(t):
-            if self.langevin_steps <= 1:
+            if n_steps <= 1:
                 return tau_end
-            frac = t / (self.langevin_steps - 1)
+            frac = t / (n_steps - 1)
             return tau_start + (tau_end - tau_start) * frac
 
         # --- Record initial Q-values ---
@@ -281,7 +276,6 @@ class GumbelSoftmaxQSampler:
         q_init_mean = q_init.mean().item()
         q_init_std = q_init.std().item() if q_init.numel() > 1 else 0.0
 
-        collected_logits = []   # list of [K, seq_len, V] snapshots
         q_history = []          # list of [K] Q-value lists per step
         grad_norms_history = [] # list of [K] gradient norms per step
         grad_clipped_count = 0  # steps where any chain was clipped
@@ -290,7 +284,8 @@ class GumbelSoftmaxQSampler:
         temp = self.temperature
         q_best_ever = float("-inf")
 
-        for t in range(self.langevin_steps):
+        # --- Run burn_in Langevin steps ---
+        for t in range(n_steps):
             tau_t = _get_tau(t)
 
             # --- Compute energy and gradient ---
@@ -329,29 +324,17 @@ class GumbelSoftmaxQSampler:
             if step_max_q > q_best_ever:
                 q_best_ever = step_max_q
 
-            # --- Collection after burn-in ---
-            if t >= self.burn_in and (t - self.burn_in) % self.thin == 0:
-                collected_logits.append(logits.detach().clone())
-
-            if len(collected_logits) * self.num_chains >= self.num_samples:
-                break
-
         # Restore model state
         if model_training:
             self.model.train()
         self.q_net.train()
 
-        if not collected_logits:
-            collected_logits.append(logits.detach().clone())
+        # --- Collect: one sample per chain ---
+        # all_logits is [K, seq_len, V] — each chain produces exactly one sample
+        all_logits = logits.detach()
 
-        num_collections = len(collected_logits)
-
-        # Stack collected logits: [n_collected * K, seq_len, V]
-        all_logits = torch.cat(collected_logits, dim=0)[:self.num_samples]
-        del collected_logits
-
-        # Determine the tau at collection time (last step's tau)
-        final_tau = _get_tau(min(len(q_history) - 1, self.langevin_steps - 1))
+        # Determine the tau at collection time (final step)
+        final_tau = _get_tau(max(n_steps - 1, 0))
 
         # --- Extract discrete tokens (just argmax — no snap!) ---
         query_ids = self._extract_tokens(all_logits)
@@ -384,15 +367,15 @@ class GumbelSoftmaxQSampler:
         del random_logits, q_random
 
         # --- Diversity: pairwise cosine similarity of soft embeddings ---
-        n_samples = all_logits.shape[0]
-        if n_samples > 1:
+        K = all_logits.shape[0]
+        if K > 1:
             with torch.no_grad():
                 soft_embeds = F.softmax(all_logits / final_tau, dim=-1) @ self._wte
-                flat = soft_embeds.reshape(n_samples, -1)
+                flat = soft_embeds.reshape(K, -1)
                 flat_norm = F.normalize(flat, dim=-1)
                 cos_matrix = flat_norm @ flat_norm.T
                 mask = torch.triu(
-                    torch.ones(n_samples, n_samples, device=self.device), diagonal=1
+                    torch.ones(K, K, device=self.device), diagonal=1
                 ).bool()
                 pairwise_cos = cos_matrix[mask]
                 embed_pairwise_cosine_mean = pairwise_cos.mean().item()
@@ -456,8 +439,7 @@ class GumbelSoftmaxQSampler:
             "grad_norm_std": grad_norm_std,
             "grad_clip_frac": grad_clip_frac,
             # Collection
-            "num_collected": n_samples,
-            "num_collections": num_collections,
+            "num_collected": K,
             "langevin_steps_run": total_steps_run,
             # Best sample
             "best_q_sample_idx": best_q_sample_idx,
@@ -489,10 +471,7 @@ class LangevinQSampler:
         q_net: QNetwork,
         seq_len: int = 128,
         num_chains: int = 8,
-        num_samples: int = 8,
-        langevin_steps: int = 100,
         burn_in: int = 50,
-        thin: int = 5,
         step_size: float = 0.01,
         temperature: float = 1.0,
         noise_scale: float = 1.0,
@@ -507,10 +486,7 @@ class LangevinQSampler:
         self.q_net = q_net
         self.seq_len = seq_len
         self.num_chains = num_chains
-        self.num_samples = num_samples
-        self.langevin_steps = langevin_steps
         self.burn_in = burn_in
-        self.thin = thin
         self.step_size = step_size
         self.temperature = temperature
         self.noise_scale = noise_scale
@@ -593,7 +569,7 @@ class LangevinQSampler:
         temp = self.temperature
         q_best_ever = float("-inf")
 
-        for t in range(self.langevin_steps):
+        for t in range(self.burn_in):
             if embeds.grad is not None:
                 embeds.grad.zero_()
             q_vals = self._energy(embeds)
@@ -617,19 +593,14 @@ class LangevinQSampler:
             step_max_q = max(q_detached)
             if step_max_q > q_best_ever:
                 q_best_ever = step_max_q
-            if t >= self.burn_in and (t - self.burn_in) % self.thin == 0:
-                collected.append(embeds.detach().clone())
-            if len(collected) * self.num_chains >= self.num_samples:
-                break
 
         if model_training:
             self.model.train()
         self.q_net.train()
-        if not collected:
-            collected.append(embeds.detach().clone())
-        num_collections = len(collected)
-        all_embeds = torch.cat(collected, dim=0)[:self.num_samples]
-        del collected, embeds
+
+        # Collect: one sample per chain
+        all_embeds = embeds.detach()
+        del embeds
 
         query_ids, snap_cosine_sims = self._snap_to_tokens(all_embeds)
         snap_cosine_mean = snap_cosine_sims.mean().item()
@@ -689,7 +660,7 @@ class LangevinQSampler:
             "token_jaccard_mean": token_jaccard_mean,
             "grad_norm_mean": grad_norm_mean, "grad_norm_std": grad_norm_std,
             "grad_clip_frac": grad_clip_frac,
-            "num_collected": n_samples, "num_collections": num_collections,
+            "num_collected": n_samples,
             "langevin_steps_run": total_steps_run,
             "best_q_sample_idx": best_q_sample_idx,
             "softmax_entropy_mean": 0.0,
@@ -742,6 +713,9 @@ class RAGIndex:
         Stream through the dataset, tokenize into fixed-length windows,
         embed each window's text, and build a FAISS index.
 
+        Stores the streaming iterator so that refresh_index() can continue
+        from where this left off (no overlap with the initial index).
+
         Args:
             tokenizer: GPT-2 tokenizer for decoding windows back to text.
             seq_len: Token window length.
@@ -753,27 +727,20 @@ class RAGIndex:
 
         print(f"[RAG] Building index from {dataset_name} ({self.index_size} windows)...")
 
-        dataset = load_dataset(dataset_name, split=split, streaming=True)
-        buffer = []
-        windows_tokens = []   # list of [seq_len] token lists
-        windows_text = []     # list of decoded strings
+        self._tokenizer = tokenizer
+        self._seq_len = seq_len
+        self._dataset_name = dataset_name
+        self._split = split
 
-        for example in dataset:
-            text = example["text"]
-            tokens = tokenizer.encode(text, add_special_tokens=False)
-            buffer.extend(tokens)
-            while len(buffer) >= seq_len and len(windows_tokens) < self.index_size:
-                window_tok = buffer[:seq_len]
-                buffer = buffer[seq_len:]
-                windows_tokens.append(window_tok)
-                windows_text.append(tokenizer.decode(window_tok))
-            if len(windows_tokens) >= self.index_size:
-                break
+        # Create a streaming iterator we'll keep alive for refreshes
+        self._stream_iter = iter(load_dataset(dataset_name, split=split, streaming=True))
+        self._token_buffer = []
+
+        windows_tokens, windows_text = self._consume_windows(self.index_size)
 
         n = len(windows_tokens)
         print(f"[RAG] Collected {n} windows. Embedding...")
 
-        # Embed all windows in batches
         all_embeddings = self.embed_model.encode(
             windows_text,
             batch_size=self.embed_batch_size,
@@ -782,31 +749,109 @@ class RAGIndex:
             normalize_embeddings=True,
         )  # [n, embed_dim]
 
-        # Build FAISS index (inner product on normalized vectors = cosine similarity)
         self.index = faiss.IndexFlatIP(self.embed_dim)
         self.index.add(all_embeddings.astype(np.float32))
 
         self.stored_token_ids = torch.tensor(windows_tokens, dtype=torch.long)  # [n, seq_len]
         self.stored_texts = windows_text
+        self._total_windows_consumed = n
 
         print(f"[RAG] Index built: {self.index.ntotal} vectors, dim={self.embed_dim}")
+
+    def _consume_windows(self, count: int) -> Tuple[list, list]:
+        """Consume `count` token windows from the streaming dataset iterator."""
+        windows_tokens = []
+        windows_text = []
+        for example in self._stream_iter:
+            text = example["text"]
+            tokens = self._tokenizer.encode(text, add_special_tokens=False)
+            self._token_buffer.extend(tokens)
+            while len(self._token_buffer) >= self._seq_len and len(windows_tokens) < count:
+                window_tok = self._token_buffer[:self._seq_len]
+                self._token_buffer = self._token_buffer[self._seq_len:]
+                windows_tokens.append(window_tok)
+                windows_text.append(self._tokenizer.decode(window_tok))
+            if len(windows_tokens) >= count:
+                break
+        return windows_tokens, windows_text
+
+    def refresh_index(self):
+        """
+        Replace the entire FAISS index with fresh data from the stream.
+
+        Continues reading from where the previous build/refresh left off,
+        so there is no overlap with previously indexed data. If the stream
+        is exhausted, wraps around by creating a new iterator.
+
+        Call this periodically (e.g. every N training steps) to prevent
+        the LM from overfitting on a fixed pool of retrieved examples.
+        """
+        import faiss
+
+        # Try to consume fresh windows; if stream is exhausted, restart
+        windows_tokens, windows_text = self._consume_windows(self.index_size)
+        if len(windows_tokens) < self.index_size:
+            print(f"[RAG refresh] Stream exhausted after {len(windows_tokens)} windows. "
+                  f"Restarting stream...")
+            from datasets import load_dataset
+            self._stream_iter = iter(
+                load_dataset(self._dataset_name, split=self._split, streaming=True)
+            )
+            self._token_buffer = []
+            more_tokens, more_text = self._consume_windows(
+                self.index_size - len(windows_tokens)
+            )
+            windows_tokens.extend(more_tokens)
+            windows_text.extend(more_text)
+
+        n = len(windows_tokens)
+        all_embeddings = self.embed_model.encode(
+            windows_text,
+            batch_size=self.embed_batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+
+        self.index = faiss.IndexFlatIP(self.embed_dim)
+        self.index.add(all_embeddings.astype(np.float32))
+
+        self.stored_token_ids = torch.tensor(windows_tokens, dtype=torch.long)
+        self.stored_texts = windows_text
+        self._total_windows_consumed += n
+
+        print(f"[RAG refresh] Index replaced: {n} fresh windows "
+              f"(total consumed: {self._total_windows_consumed})")
 
     def retrieve(
         self,
         query_ids: torch.Tensor,
         tokenizer,
         top_k: Optional[int] = None,
+        sample_from_topk: bool = True,
+        sample_temperature: float = 0.1,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Retrieve training examples from the index using query token sequences.
 
-        For each query, decode to text, embed, search the FAISS index, and
-        return the top-k results. Results are deduplicated across all queries.
+        For each query, decode to text, embed, search the FAISS index.
+        When sample_from_topk=True (default), retrieves top-k candidates per
+        query and samples 1 from softmax(scores / temperature), giving
+        diversity within the relevant neighborhood. When False, takes the
+        top-1 deterministically.
+
+        Results are deduplicated across all queries.
 
         Args:
-            query_ids: [B, seq_len] discrete token IDs (from Langevin snap).
+            query_ids: [B, seq_len] discrete token IDs (from Langevin/Gumbel).
             tokenizer: GPT-2 tokenizer for decoding.
-            top_k: Number of results per query (default: self.retrieval_top_k).
+            top_k: Number of FAISS candidates per query to score.
+                   Default: self.retrieval_top_k.
+            sample_from_topk: If True, softmax-sample 1 from top-k per query.
+                              If False, take top-1 deterministically.
+            sample_temperature: Temperature for softmax sampling over top-k
+                                scores. Lower = more greedy, higher = more
+                                uniform. Only used when sample_from_topk=True.
 
         Returns:
             retrieved_ids: [R, seq_len] token IDs of retrieved examples.
@@ -829,14 +874,37 @@ class RAGIndex:
             normalize_embeddings=True,
         )  # [B, embed_dim]
 
-        # Search FAISS index
+        # Search FAISS index for top-k candidates per query
         scores, indices = self.index.search(query_embeddings.astype(np.float32), top_k)
         # scores: [B, top_k], indices: [B, top_k]
 
-        # Deduplicate retrieved indices across all queries
-        unique_indices = list(set(indices.flatten().tolist()))
-        # Remove -1 (FAISS sentinel for not-found)
-        unique_indices = [idx for idx in unique_indices if idx >= 0]
+        if sample_from_topk and top_k > 1:
+            # Softmax-sample 1 result per query from the top-k candidates.
+            # This gives diversity: instead of every query taking its nearest
+            # neighbor (which often overlap), we sample proportionally to
+            # similarity, so different queries can pull different examples
+            # from their local neighborhoods.
+            selected_indices = []
+            for b in range(scores.shape[0]):
+                row_scores = scores[b]
+                row_indices = indices[b]
+                # Filter out -1 sentinels
+                valid = row_indices >= 0
+                if not valid.any():
+                    continue
+                row_scores = row_scores[valid]
+                row_indices = row_indices[valid]
+                # Softmax sampling
+                probs = np.exp(row_scores / sample_temperature)
+                probs = probs / probs.sum()
+                chosen = np.random.choice(len(row_indices), p=probs)
+                selected_indices.append(int(row_indices[chosen]))
+        else:
+            # Deterministic top-1
+            selected_indices = indices[:, 0].tolist()
+
+        # Deduplicate
+        unique_indices = list(set(idx for idx in selected_indices if idx >= 0))
 
         retrieved_ids = self.stored_token_ids[unique_indices]  # [R, seq_len]
 
@@ -844,7 +912,7 @@ class RAGIndex:
             "num_queries": len(query_texts),
             "num_retrieved_unique": len(unique_indices),
             "avg_top1_score": float(scores[:, 0].mean()),
-            "avg_topk_score": float(scores.mean()),
+            "avg_topk_score": float(scores.mean()) if top_k > 1 else float(scores[:, 0].mean()),
             "sample_query": query_texts[0][:200] if query_texts else "",
         }
 
