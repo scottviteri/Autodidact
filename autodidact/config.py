@@ -161,7 +161,7 @@ class AutodidactConfig:
                                       # efficiency.  256 ≈ the last 256 training steps; hidden states
                                       # remain on-distribution with slow LM learning rates.
     q_replay_batch_size: int = 32     # Mini-batch size for each replay gradient step.
-    q_replay_updates_per_step: int = 4  # Extra Q gradient steps from replay after each online TD update.
+    q_replay_updates_per_step: int = 1  # Extra Q gradient steps from replay after each online TD update.
                                         # Total Q updates per step = 1 (online) + this many (replay).
                                         # 4 replay updates with batch_size=32 means the Q-head sees
                                         # 128 + 1 = 129 effective training examples per step vs. 1.
