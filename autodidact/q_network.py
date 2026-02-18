@@ -12,12 +12,19 @@ Architecture (from Section 2.3 of the spec):
     for the TD step so that value gradients also shape the LM representations.
 
     Dimensions: d -> 32 -> 1  (d = 768 for GPT-2)
+
+Also provides QReplayBuffer for sample-efficient Q-learning via experience
+replay.  Each training step stores (h, y) pairs — the hidden state and its
+TD target — in a fixed-capacity ring buffer.  Between online Q updates, extra
+mini-batch gradient steps are drawn from the buffer, giving the Q-head many
+more learning signals per environment step.
 """
 
 import math
 
 import torch
 import torch.nn as nn
+import numpy as np
 
 
 class QNetwork(nn.Module):
@@ -44,6 +51,56 @@ class QNetwork(nn.Module):
             Q-values, shape [N, 1] or [1].
         """
         return self.net(h)
+
+
+class QReplayBuffer:
+    """
+    Fixed-capacity ring buffer for experience replay of Q-learning transitions.
+
+    Stores (h, y) pairs where h is a detached hidden state and y is the
+    pre-computed TD target:  y = (1 - gamma) * r + gamma * V_target(s').
+
+    Storing the scalar target y (rather than (r, V')) avoids having to
+    recompute V' at replay time and keeps the buffer tiny.  Hidden states
+    do become stale as theta drifts, but with a short buffer (e.g. 256
+    transitions) and slow LM learning rates the distribution shift is
+    manageable — empirically this is the standard DQN tradeoff.
+
+    Usage:
+        buf = QReplayBuffer(capacity=256, hidden_dim=768, device='cuda')
+        # each step:
+        buf.push(h_prev.detach(), y.item())
+        if buf.can_sample(batch_size=32):
+            h_batch, y_batch = buf.sample(32)
+            # compute loss on the batch and update Q
+    """
+
+    def __init__(self, capacity: int = 256, hidden_dim: int = 768,
+                 device: torch.device = torch.device("cpu")):
+        self.capacity = capacity
+        self.device = device
+        self._h = torch.zeros(capacity, hidden_dim, device=device)
+        self._y = torch.zeros(capacity, device=device)
+        self._size = 0
+        self._write = 0
+
+    def push(self, h: torch.Tensor, y: float):
+        """Store one (h, y) transition."""
+        self._h[self._write] = h.detach().to(self.device)
+        self._y[self._write] = y
+        self._write = (self._write + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def can_sample(self, batch_size: int) -> bool:
+        return self._size >= batch_size
+
+    def sample(self, batch_size: int):
+        """Return (h_batch [B, d], y_batch [B]) sampled uniformly."""
+        idx = torch.randint(0, self._size, (batch_size,), device=self.device)
+        return self._h[idx], self._y[idx]
+
+    def __len__(self):
+        return self._size
 
 
 def extract_hidden_states(model, input_ids: torch.Tensor, batch_size: int = 32) -> torch.Tensor:

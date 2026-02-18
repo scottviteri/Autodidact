@@ -359,7 +359,7 @@ class LangevinRAGDashboard:
 
             # ===== Row 2: Q-learning =====
 
-            # (1,0) TD Loss
+            # (1,0) TD Loss (online + replay)
             ax = axes[1][0]
             td_steps = [m["step"] for m in metrics if "td_loss" in m]
             td_vals = [max(m["td_loss"], 1e-12) for m in metrics if "td_loss" in m]
@@ -367,7 +367,16 @@ class LangevinRAGDashboard:
                 ax.semilogy(td_steps, td_vals, color=c, alpha=0.4, linewidth=0.5)
                 if len(td_vals) >= 20:
                     smoothed = _smooth([math.log(v) for v in td_vals], 20)
-                    ax.semilogy(td_steps[19:], [math.exp(v) for v in smoothed], color=c, linewidth=1.8, label=method)
+                    ax.semilogy(td_steps[19:], [math.exp(v) for v in smoothed], color=c, linewidth=1.8, label="online TD")
+            # Overlay replay TD loss if present
+            replay_steps = [m["step"] for m in metrics if "replay_td_loss" in m and m["replay_td_loss"] > 0]
+            replay_vals = [max(m["replay_td_loss"], 1e-12) for m in metrics if "replay_td_loss" in m and m["replay_td_loss"] > 0]
+            if replay_steps:
+                ax.semilogy(replay_steps, replay_vals, color="purple", alpha=0.3, linewidth=0.5)
+                if len(replay_vals) >= 20:
+                    smoothed_r = _smooth([math.log(v) for v in replay_vals], 20)
+                    ax.semilogy(replay_steps[19:], [math.exp(v) for v in smoothed_r], color="purple", linewidth=1.8, label="replay TD")
+                ax.legend(fontsize=6, loc="best")
 
             # (1,1) SGLD Q vs Random Q (the key unbiased comparison)
             ax = axes[1][1]

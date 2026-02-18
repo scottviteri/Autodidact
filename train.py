@@ -170,6 +170,14 @@ def parse_args() -> AutodidactConfig:
     parser.add_argument("--td_lambda", type=float, default=_defaults.td_lambda,
                         help="Scaling coefficient for TD gradients flowing into theta (1.0 = full strength)")
 
+    # Q experience replay
+    parser.add_argument("--q_replay_buffer_size", type=int, default=_defaults.q_replay_buffer_size,
+                        help="Ring buffer capacity for Q-learning experience replay (0=disabled)")
+    parser.add_argument("--q_replay_batch_size", type=int, default=_defaults.q_replay_batch_size,
+                        help="Mini-batch size for each replay gradient step")
+    parser.add_argument("--q_replay_updates_per_step", type=int, default=_defaults.q_replay_updates_per_step,
+                        help="Extra Q gradient steps from replay after each online TD update")
+
     args = parser.parse_args()
     return AutodidactConfig(**vars(args))
 
@@ -277,6 +285,9 @@ def main():
             topic_pool_size=config.topic_pool_size,
             topic_temperature=config.topic_temperature,
             no_q_weighting=config.no_q_weighting,
+            q_replay_buffer_size=config.q_replay_buffer_size,
+            q_replay_batch_size=config.q_replay_batch_size,
+            q_replay_updates_per_step=config.q_replay_updates_per_step,
         )
         log_file = trainer.train(num_steps=config.num_steps)
         all_log_files.append(log_file)

@@ -27,7 +27,7 @@ from typing import Optional, Dict, Any, List
 import time
 import math
 
-from .q_network import QNetwork, extract_hidden_states, extract_hidden_state_with_grad, compute_soft_value, boltzmann_sample
+from .q_network import QNetwork, QReplayBuffer, extract_hidden_states, extract_hidden_state_with_grad, compute_soft_value, boltzmann_sample
 from .data import DataStream, HeldOutSet, TopicSimilarityTracker
 from .baselines import BaselineSelector
 from .logging import MetricsLogger, DashboardPlotter, LangevinRAGDashboard
@@ -971,6 +971,10 @@ class LangevinRAGTrainer:
         topic_temperature: float = 0.1,
         # Q-weighted LM training
         no_q_weighting: bool = True,  # True = uniform (unweighted), False = softmax(Q/beta) weights
+        # Q experience replay
+        q_replay_buffer_size: int = 256,    # ring buffer capacity (0 = disabled)
+        q_replay_batch_size: int = 32,      # mini-batch size for replay updates
+        q_replay_updates_per_step: int = 4, # extra Q gradient steps from replay each training step
     ):
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         print(f"[LangevinRAG] Using device: {self.device}")
@@ -991,6 +995,19 @@ class LangevinRAGTrainer:
         self.q_target = copy.deepcopy(self.q_net)
         self.q_target.requires_grad_(False)
         self.tau = tau
+
+        # --- Q experience replay buffer ---
+        self.q_replay_buffer_size = q_replay_buffer_size
+        self.q_replay_batch_size = q_replay_batch_size
+        self.q_replay_updates_per_step = q_replay_updates_per_step
+        if q_replay_buffer_size > 0:
+            self.q_replay_buffer = QReplayBuffer(
+                capacity=q_replay_buffer_size,
+                hidden_dim=hidden_dim,
+                device=self.device,
+            )
+        else:
+            self.q_replay_buffer = None
 
         # --- LM optimizer ---
         self.lm_optimizer = torch.optim.AdamW(self.model.parameters(), lr=lm_lr)
@@ -1142,6 +1159,9 @@ class LangevinRAGTrainer:
             "td_lambda": td_lambda,
             "alternating_period": alternating_period,
             "no_q_weighting": no_q_weighting,
+            "q_replay_buffer_size": q_replay_buffer_size,
+            "q_replay_batch_size": q_replay_batch_size,
+            "q_replay_updates_per_step": q_replay_updates_per_step,
             "topic_coherent": topic_coherent,
             "topic_pool_size": topic_pool_size,
             "topic_temperature": topic_temperature,
@@ -1189,11 +1209,19 @@ class LangevinRAGTrainer:
         soft_value_next: torch.Tensor,
     ) -> tuple:
         """
-        Q-network update (normalised discounted soft Bellman).
-        Same structure as AutodidactTrainer._q_step with td_into_theta support.
+        Q-network update (normalised discounted soft Bellman) with optional
+        experience replay.
 
-        Returns (td_loss_value, q_grad_norm, lm_td_grad_norm).
+        1. Online update: standard TD step on the current (h_prev, r, V') transition.
+        2. Replay updates: if the replay buffer is enabled and has enough samples,
+           draw q_replay_updates_per_step mini-batches and do extra gradient steps.
+           Each replay step also does a Polyak update, keeping the target network
+           in sync.
+
+        Returns (td_loss_value, q_grad_norm, lm_td_grad_norm, replay_td_loss).
+            replay_td_loss is 0.0 when replay is disabled or the buffer is too small.
         """
+        # --- 1. Online TD update (same as before) ---
         self.q_optimizer.zero_grad()
         if self.td_into_theta:
             self.lm_optimizer.zero_grad()
@@ -1222,7 +1250,32 @@ class LangevinRAGTrainer:
             self.lm_optimizer.step()
 
         self._polyak_update()
-        return td_loss.item(), q_grad_norm, lm_td_grad_norm
+
+        # --- 2. Store transition in replay buffer ---
+        replay_td_loss = 0.0
+        if self.q_replay_buffer is not None:
+            self.q_replay_buffer.push(h_prev.detach(), y.detach().item())
+
+            # --- 3. Replay updates ---
+            if self.q_replay_buffer.can_sample(self.q_replay_batch_size):
+                replay_losses = []
+                for _ in range(self.q_replay_updates_per_step):
+                    h_batch, y_batch = self.q_replay_buffer.sample(self.q_replay_batch_size)
+
+                    self.q_optimizer.zero_grad()
+                    q_batch = self.q_net(h_batch).squeeze(-1)  # [B]
+                    batch_loss = 0.5 * ((q_batch - y_batch) ** 2).mean()
+                    batch_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.q_net.parameters(), self.q_grad_clip
+                    )
+                    self.q_optimizer.step()
+                    self._polyak_update()
+                    replay_losses.append(batch_loss.item())
+
+                replay_td_loss = sum(replay_losses) / len(replay_losses)
+
+        return td_loss.item(), q_grad_norm, lm_td_grad_norm, replay_td_loss
 
     def _lm_step_batch(self, batch_ids: torch.Tensor, micro_batch_size: Optional[int] = None) -> tuple:
         """
@@ -1521,7 +1574,7 @@ class LangevinRAGTrainer:
                 with torch.no_grad():
                     q_warmup_target = self.q_target(H_warmup)
                 V_target = compute_soft_value(q_warmup_target, self.beta)
-                td_loss, q_grad_norm, _ = self._q_step(h_prev, r_prev, V_target)
+                td_loss, q_grad_norm, _, _replay_loss = self._q_step(h_prev, r_prev, V_target)
 
                 # Track h_prev for next step's Q update
                 h_prev = H_warmup[0].detach()
@@ -1746,7 +1799,7 @@ class LangevinRAGTrainer:
                 h_prev_for_td = extract_hidden_state_with_grad(self.model, prev_action_ids)
             else:
                 h_prev_for_td = h_prev
-            td_loss, q_grad_norm, lm_td_grad_norm = self._q_step(h_prev_for_td, r_prev, V_target)
+            td_loss, q_grad_norm, lm_td_grad_norm, replay_td_loss = self._q_step(h_prev_for_td, r_prev, V_target)
 
             h_prev = H_retrieved[0].detach()
             if self.td_into_theta:
@@ -1850,6 +1903,9 @@ class LangevinRAGTrainer:
             }
             if self.td_into_theta:
                 metrics["lm_td_grad_norm"] = lm_td_grad_norm
+            if self.q_replay_buffer is not None:
+                metrics["replay_td_loss"] = replay_td_loss
+                metrics["replay_buffer_size"] = len(self.q_replay_buffer)
 
             # --- Topic similarity: best-Q SGLD query + retrieved examples vs held-out ---
             if k % self.log_interval == 0:
@@ -1887,9 +1943,12 @@ class LangevinRAGTrainer:
                     mode_tag = " [RST]"
                 elif self.alternating_period > 0:
                     mode_tag = " [REG]"
+                replay_msg = ""
+                if self.q_replay_buffer is not None and replay_td_loss > 0:
+                    replay_msg = f" | replay_td={replay_td_loss:.6f}"
                 print(
                     f"[LangevinRAG] Step {global_step:6d}{mode_tag} | reward={r_k:.4f} | "
-                    f"lm_loss={lm_loss:.4f} | td={td_loss:.6f} | "
+                    f"lm_loss={lm_loss:.4f} | td={td_loss:.6f}{replay_msg} | "
                     f"sgld_Q={langevin_info['q_final_mean']:.3f} "
                     f"(rand={langevin_info['q_random_mean']:.3f} "
                     f"gain={langevin_info['q_gain']:+.3f}) | "
